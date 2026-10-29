@@ -96,7 +96,7 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 	}
 	payload := map[string]any{
 		"model": s.cfg.AIModel, "temperature": 0.0, "top_p": 1.0,
-		"max_tokens": 120, "stream": emit != nil,
+		"max_tokens": 1024, "stream": emit != nil,
 		"response_format": map[string]string{"type": "json_object"},
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
@@ -122,46 +122,9 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 		responseBody, _ := io.ReadAll(io.LimitReader(res.Body, 500))
 		return models.AnalyzeResponse{}, fmt.Errorf("AI returned status %d: %s", res.StatusCode, string(responseBody))
 	}
-	var content string
-	if emit == nil {
-		responseBody, err := io.ReadAll(res.Body)
-		if err != nil {
-			return models.AnalyzeResponse{}, err
-		}
-		var raw map[string]any
-		if err := json.Unmarshal(responseBody, &raw); err != nil {
-			return models.AnalyzeResponse{}, fmt.Errorf("invalid AI response: %w", err)
-		}
-		content = extractContent(raw)
-	} else {
-		scanner := bufio.NewScanner(res.Body)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				break
-			}
-			var event map[string]any
-			if json.Unmarshal([]byte(data), &event) != nil {
-				continue
-			}
-			piece := streamDelta(event)
-			if piece != "" {
-				content += piece
-				if err := emit(piece); err != nil {
-					return models.AnalyzeResponse{}, err
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			return models.AnalyzeResponse{}, err
-		}
-	}
-	if strings.TrimSpace(content) == "" {
-		return models.AnalyzeResponse{}, fmt.Errorf("AI response has no message content")
+	content, err := readAIResponse(res, emit)
+	if err != nil {
+		return models.AnalyzeResponse{}, err
 	}
 	var result models.AnalyzeResponse
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
@@ -213,6 +176,124 @@ func truncate(value string, limit int) string {
 		return value
 	}
 	return value[:limit] + "..."
+}
+
+// Some compatible gateways return a complete JSON response even when stream is
+// requested. Inspect the body as well as the header so that answer is not lost.
+func readAIResponse(res *http.Response, emit func(string) error) (string, error) {
+	reader := bufio.NewReader(res.Body)
+	for {
+		b, err := reader.Peek(1)
+		if err != nil {
+			if err == io.EOF {
+				return "", fmt.Errorf("AI response has no message content: empty body")
+			}
+			return "", err
+		}
+		if !strings.ContainsRune(" \t\r\n", rune(b[0])) {
+			break
+		}
+		_, _ = reader.ReadByte()
+	}
+	first, _ := reader.Peek(1)
+	if first[0] == '{' || strings.Contains(res.Header.Get("Content-Type"), "application/json") {
+		var raw map[string]any
+		if err := json.NewDecoder(reader).Decode(&raw); err != nil {
+			return "", fmt.Errorf("invalid AI response: %w", err)
+		}
+		if err := aiResponseError(raw); err != nil {
+			return "", err
+		}
+		content := extractContent(raw)
+		if strings.TrimSpace(content) == "" {
+			return "", fmt.Errorf("AI response has no message content (finish_reason=%q)", aiFinishReason(raw))
+		}
+		if emit != nil {
+			if err := emit(content); err != nil {
+				return "", err
+			}
+		}
+		return content, nil
+	}
+	if emit == nil {
+		return "", fmt.Errorf("expected AI JSON response")
+	}
+	var content strings.Builder
+	var finishReason string
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	var dataLines []string
+	done := false
+	consume := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		data := strings.Join(dataLines, "\n")
+		dataLines = nil
+		if strings.TrimSpace(data) == "[DONE]" {
+			done = true
+			return nil
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return fmt.Errorf("invalid AI stream event: %w", err)
+		}
+		if err := aiResponseError(event); err != nil {
+			return err
+		}
+		if reason := aiFinishReason(event); reason != "" {
+			finishReason = reason
+		}
+		if piece := streamDelta(event); piece != "" {
+			content.WriteString(piece)
+			return emit(piece)
+		}
+		return nil
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := consume(); err != nil {
+				return "", err
+			}
+			if done {
+				break
+			}
+		} else if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	if err := consume(); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content.String()) == "" {
+		return "", fmt.Errorf("AI response has no message content (finish_reason=%q)", finishReason)
+	}
+	return content.String(), nil
+}
+
+func aiFinishReason(data map[string]any) string {
+	if choices, ok := data["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			reason, _ := choice["finish_reason"].(string)
+			return reason
+		}
+	}
+	return ""
+}
+
+func aiResponseError(data map[string]any) error {
+	if value := data["error"]; value != nil {
+		// Do not log provider messages: they may echo a child's answer or secrets.
+		return fmt.Errorf("AI provider returned an error response")
+	}
+	if reason := aiFinishReason(data); reason == "length" || reason == "content_filter" {
+		return fmt.Errorf("AI response incomplete (finish_reason=%q)", reason)
+	}
+	return nil
 }
 
 func streamDelta(data map[string]any) string {
