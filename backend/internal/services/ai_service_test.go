@@ -214,3 +214,43 @@ func TestGenerateTasksFailover(t *testing.T) {
 		t.Fatalf("tasks=%v calls=%d err=%v", tasks, calls, err)
 	}
 }
+
+func TestIndependentProviderAnalysisDeadlines(t *testing.T) {
+	for _, shortParent := range []bool{false, true} {
+		cfg := &config.Config{AIURL: "https://primary.example", AIToken: "a", AIModel: "a",
+			AIFallbackURL: "https://backup.example", AIFallbackToken: "b", AIFallbackModel: "b",
+			AIAnalyzeTimeout: 10 * time.Second, AIFallbackAnalyzeTimeout: 45 * time.Second}
+		svc := NewAIService(cfg)
+		ctx := context.Background()
+		parentDeadline := time.Now().Add(time.Second)
+		if shortParent {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, parentDeadline)
+			defer cancel()
+		}
+		calls := 0
+		svc.client.Transport = aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				t.Fatal("missing analysis deadline")
+			}
+			if shortParent {
+				if !deadline.Equal(parentDeadline) {
+					t.Fatal("provider timeout extended parent deadline")
+				}
+			} else if r.URL.Host == "backup.example" {
+				if remaining := time.Until(deadline); remaining <= 10*time.Second || remaining > 45*time.Second {
+					t.Fatalf("fallback did not get its own timeout: %s", remaining)
+				}
+			} else if time.Until(deadline) > 10*time.Second {
+				t.Fatal("primary deadline changed")
+			}
+			return &http.Response{StatusCode: 503, Header: http.Header{}, Body: http.NoBody}, nil
+		})
+		_, err := svc.Analyze(ctx, models.SafetyTask{}, "Ответ")
+		if err == nil || calls != 2 || cfg.AIAnalyzeTimeout != 10*time.Second {
+			t.Fatalf("err=%v calls=%d primary timeout=%s", err, calls, cfg.AIAnalyzeTimeout)
+		}
+	}
+}

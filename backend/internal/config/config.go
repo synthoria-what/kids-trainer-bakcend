@@ -10,22 +10,23 @@ import (
 )
 
 type Config struct {
-	AdminLogin       string
-	AdminPassword    string
-	DevMode          bool
-	HTTPAddr         string
-	DatabasePath     string
-	JWTSecret        string
-	JWTTL            time.Duration
-	CORSOrigins      []string
-	AIURL            string
-	AIToken          string
-	AIModel          string
-	AIFallbackURL    string
-	AIFallbackToken  string
-	AIFallbackModel  string
-	AITimeout        time.Duration
-	AIAnalyzeTimeout time.Duration
+	AdminLogin               string
+	AdminPassword            string
+	DevMode                  bool
+	HTTPAddr                 string
+	DatabasePath             string
+	JWTSecret                string
+	JWTTL                    time.Duration
+	CORSOrigins              []string
+	AIURL                    string
+	AIToken                  string
+	AIModel                  string
+	AIFallbackURL            string
+	AIFallbackToken          string
+	AIFallbackModel          string
+	AITimeout                time.Duration
+	AIAnalyzeTimeout         time.Duration
+	AIFallbackAnalyzeTimeout time.Duration
 }
 
 func Load() (*Config, error) {
@@ -64,6 +65,11 @@ func Load() (*Config, error) {
 	} else {
 		cfg.AIAnalyzeTimeout = 20 * time.Second
 	}
+	fallbackTimeout, err := strconv.Atoi(getEnv("AI_FALLBACK_ANALYZE_TIMEOUT_SECONDS", "45"))
+	if err != nil || fallbackTimeout <= 0 {
+		return nil, fmt.Errorf("AI_FALLBACK_ANALYZE_TIMEOUT_SECONDS must be a positive integer")
+	}
+	cfg.AIFallbackAnalyzeTimeout = time.Duration(fallbackTimeout) * time.Second
 	return cfg, nil
 }
 

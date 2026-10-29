@@ -25,6 +25,7 @@ func NewAIService(cfg *config.Config) *AIService {
 	log.Printf("AI configuration: primary_configured=%t fallback_configured=%t",
 		cfg.AIURL != "" && cfg.AIToken != "" && cfg.AIModel != "",
 		cfg.AIFallbackURL != "" && cfg.AIFallbackToken != "" && cfg.AIFallbackModel != "")
+	log.Printf("AI timeouts: primary_analysis=%s fallback_analysis=%s http=%s", cfg.AIAnalyzeTimeout, cfg.AIFallbackAnalyzeTimeout, cfg.AITimeout)
 	return &AIService{cfg: cfg, client: &http.Client{Timeout: cfg.AITimeout}}
 }
 
@@ -37,6 +38,9 @@ func (s *AIService) providers() []*AIService {
 	if s.cfg.AIFallbackURL != "" && s.cfg.AIFallbackToken != "" && s.cfg.AIFallbackModel != "" {
 		cfg := *s.cfg
 		cfg.AIURL, cfg.AIToken, cfg.AIModel = cfg.AIFallbackURL, cfg.AIFallbackToken, cfg.AIFallbackModel
+		if cfg.AIFallbackAnalyzeTimeout > 0 {
+			cfg.AIAnalyzeTimeout = cfg.AIFallbackAnalyzeTimeout
+		}
 		providers = append(providers, &AIService{cfg: &cfg, client: s.client})
 	}
 	return providers
@@ -209,7 +213,7 @@ func (s *AIService) analyzeOnce(ctx context.Context, task models.SafetyTask, ans
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return models.AnalyzeResponse{}, fmt.Errorf("AI returned status %d", res.StatusCode)
+		return models.AnalyzeResponse{}, aiHTTPError(res)
 	}
 	content, err := readAIResponse(res, emit)
 	if err != nil {
@@ -244,7 +248,7 @@ func (s *AIService) chat(ctx context.Context, body []byte) (string, error) {
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("AI returned status %d", res.StatusCode)
+		return "", aiHTTPError(res)
 	}
 	return readAIResponse(res, nil)
 }
@@ -358,8 +362,7 @@ func aiFinishReason(data map[string]any) string {
 
 func aiResponseError(data map[string]any) error {
 	if value := data["error"]; value != nil {
-		// Do not log provider messages: they may echo a child's answer or secrets.
-		return fmt.Errorf("AI provider returned an error response")
+		return aiProviderError(value)
 	}
 	if reason := aiFinishReason(data); reason == "length" || reason == "content_filter" {
 		return fmt.Errorf("AI response incomplete (finish_reason=%q)", reason)
