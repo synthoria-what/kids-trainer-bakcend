@@ -1,0 +1,10 @@
+.env
+.env.*
+data/*.db
+data/*.db-shm
+data/*.db-wal
+.git
+.gitignore
+Dockerfile
+README.md
+*_test.go
