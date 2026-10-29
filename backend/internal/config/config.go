@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -20,6 +21,9 @@ type Config struct {
 	AIURL            string
 	AIToken          string
 	AIModel          string
+	AIFallbackURL    string
+	AIFallbackToken  string
+	AIFallbackModel  string
 	AITimeout        time.Duration
 	AIAnalyzeTimeout time.Duration
 }
@@ -27,16 +31,23 @@ type Config struct {
 func Load() (*Config, error) {
 	_ = godotenv.Load()
 	cfg := &Config{
-		AdminLogin:    getEnv("DEV_ADMIN_LOGIN", ""),
-		AdminPassword: getEnv("DEV_ADMIN_PASSWORD", ""),
-		DevMode:       getEnv("APP_ENV", "production") == "development",
-		HTTPAddr:      getEnv("HTTP_ADDR", ":8080"),
-		DatabasePath:  getEnv("DATABASE_PATH", "./data/safe_route.db"),
-		JWTSecret:     getEnv("JWT_SECRET", "dev-secret-change-me"),
-		CORSOrigins:   splitEnv(getEnv("CORS_ORIGINS", "http://localhost:3000")),
-		AIURL:         getEnv("AI_API_URL", "https://lenec.tech/v1/chat/completions"),
-		AIToken:       getEnv("AI_API_TOKEN", ""),
-		AIModel:       getEnv("AI_MODEL", ""),
+		AdminLogin:      getEnv("DEV_ADMIN_LOGIN", ""),
+		AdminPassword:   getEnv("DEV_ADMIN_PASSWORD", ""),
+		DevMode:         getEnv("APP_ENV", "production") == "development",
+		HTTPAddr:        getEnv("HTTP_ADDR", ":8080"),
+		DatabasePath:    getEnv("DATABASE_PATH", "./data/safe_route.db"),
+		JWTSecret:       getEnv("JWT_SECRET", "dev-secret-change-me"),
+		CORSOrigins:     splitEnv(getEnv("CORS_ORIGINS", "http://localhost:3000")),
+		AIURL:           getEnv("AI_API_URL", "https://lenec.tech/v1/chat/completions"),
+		AIToken:         getEnv("AI_API_TOKEN", ""),
+		AIModel:         getEnv("AI_MODEL", ""),
+		AIFallbackURL:   getEnv("AI_FALLBACK_API_URL", ""),
+		AIFallbackToken: getEnv("AI_FALLBACK_API_TOKEN", ""),
+		AIFallbackModel: getEnv("AI_FALLBACK_MODEL", ""),
+	}
+	if (cfg.AIFallbackURL != "" || cfg.AIFallbackToken != "" || cfg.AIFallbackModel != "") &&
+		(cfg.AIFallbackURL == "" || cfg.AIFallbackToken == "" || cfg.AIFallbackModel == "") {
+		return nil, fmt.Errorf("AI fallback requires AI_FALLBACK_API_URL, AI_FALLBACK_API_TOKEN and AI_FALLBACK_MODEL")
 	}
 	if ttl, err := strconv.Atoi(getEnv("JWT_TTL_HOURS", "168")); err == nil {
 		cfg.JWTTL = time.Duration(ttl) * time.Hour

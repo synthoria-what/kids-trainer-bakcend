@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -22,7 +24,41 @@ type AIService struct {
 func NewAIService(cfg *config.Config) *AIService {
 	return &AIService{cfg: cfg, client: &http.Client{Timeout: cfg.AITimeout}}
 }
+
+// Each attempt gets its own config; never mutate shared service state.
+func (s *AIService) providers() []*AIService {
+	var providers []*AIService
+	if s.cfg.AIURL != "" && s.cfg.AIToken != "" && s.cfg.AIModel != "" {
+		providers = append(providers, s)
+	}
+	if s.cfg.AIFallbackURL != "" && s.cfg.AIFallbackToken != "" && s.cfg.AIFallbackModel != "" {
+		cfg := *s.cfg
+		cfg.AIURL, cfg.AIToken, cfg.AIModel = cfg.AIFallbackURL, cfg.AIFallbackToken, cfg.AIFallbackModel
+		providers = append(providers, &AIService{cfg: &cfg, client: s.client})
+	}
+	return providers
+}
+
 func (s *AIService) GenerateTasks(ctx context.Context, examples []models.SafetyTask, in models.GenerateTasksRequest) ([]models.SafetyTask, error) {
+	var failures []error
+	for i, provider := range s.providers() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tasks, err := provider.generateTasks(ctx, examples, in)
+		if err == nil {
+			return tasks, nil
+		}
+		log.Printf("AI task generation: provider_attempt=%d: %v", i+1, err)
+		failures = append(failures, fmt.Errorf("provider attempt %d: %w", i+1, err))
+	}
+	if len(failures) == 0 {
+		return nil, fmt.Errorf("AI generation is not configured")
+	}
+	return nil, errors.Join(failures...)
+}
+
+func (s *AIService) generateTasks(ctx context.Context, examples []models.SafetyTask, in models.GenerateTasksRequest) ([]models.SafetyTask, error) {
 	if s.cfg.AIToken == "" || s.cfg.AIModel == "" {
 		return nil, fmt.Errorf("AI generation is not configured")
 	}
@@ -75,24 +111,66 @@ func (s *AIService) Analyze(ctx context.Context, task models.SafetyTask, answer 
 
 // AnalyzeStream forwards text as soon as the upstream model produces it. The
 // accumulated text is still validated as one JSON response before returning.
-func (s *AIService) AnalyzeStream(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error) (models.AnalyzeResponse, error) {
-	return s.analyze(ctx, task, answer, emit)
+func (s *AIService) AnalyzeStream(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error, reset ...func() error) (models.AnalyzeResponse, error) {
+	return s.analyze(ctx, task, answer, emit, reset...)
 }
 
-func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error) (models.AnalyzeResponse, error) {
-	if s.cfg != nil && s.cfg.AIAnalyzeTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.cfg.AIAnalyzeTimeout)
-		defer cancel()
-	}
-	if contains(task.Choices, answer) || s.cfg.AIToken == "" || s.cfg.AIModel == "" {
+func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error, reset ...func() error) (models.AnalyzeResponse, error) {
+	providers := s.providers()
+	if contains(task.Choices, answer) || len(providers) == 0 {
 		result := fallback(task, answer)
 		if emit != nil {
-			if err := emit(result.Summary + " " + result.Tip); err != nil {
+			body, _ := json.Marshal(result)
+			if err := emit(string(body)); err != nil {
 				return models.AnalyzeResponse{}, err
 			}
 		}
 		return result, nil
+	}
+	var failures []error
+	for i, provider := range providers {
+		if err := ctx.Err(); err != nil {
+			return models.AnalyzeResponse{}, err
+		}
+		var emitErr error
+		sent := false
+		var forward func(string) error
+		if emit != nil {
+			forward = func(piece string) error {
+				sent = true
+				emitErr = emit(piece)
+				return emitErr
+			}
+		}
+		result, err := provider.analyzeOnce(ctx, task, answer, forward)
+		if err == nil {
+			return result, nil
+		}
+		if emitErr != nil {
+			return models.AnalyzeResponse{}, emitErr
+		}
+		if ctx.Err() != nil {
+			return models.AnalyzeResponse{}, ctx.Err()
+		}
+		log.Printf("AI analysis: provider_attempt=%d: %v", i+1, err)
+		failures = append(failures, fmt.Errorf("provider attempt %d: %w", i+1, err))
+		if sent && i+1 < len(providers) {
+			if len(reset) == 0 || reset[0] == nil {
+				break // Do not mix answers when the caller cannot reset its preview.
+			}
+			if err := reset[0](); err != nil {
+				return models.AnalyzeResponse{}, err
+			}
+		}
+	}
+	return models.AnalyzeResponse{}, errors.Join(failures...)
+}
+
+func (s *AIService) analyzeOnce(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error) (models.AnalyzeResponse, error) {
+	if s.cfg != nil && s.cfg.AIAnalyzeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.cfg.AIAnalyzeTimeout)
+		defer cancel()
 	}
 	payload := map[string]any{
 		"model": s.cfg.AIModel, "temperature": 0.0, "top_p": 1.0,
@@ -119,8 +197,7 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		responseBody, _ := io.ReadAll(io.LimitReader(res.Body, 500))
-		return models.AnalyzeResponse{}, fmt.Errorf("AI returned status %d: %s", res.StatusCode, string(responseBody))
+		return models.AnalyzeResponse{}, fmt.Errorf("AI returned status %d", res.StatusCode)
 	}
 	content, err := readAIResponse(res, emit)
 	if err != nil {
@@ -128,12 +205,13 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 	}
 	var result models.AnalyzeResponse
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return models.AnalyzeResponse{}, fmt.Errorf("invalid AI JSON: %w; content: %s", err, truncate(content, 500))
+		return models.AnalyzeResponse{}, fmt.Errorf("invalid AI JSON: %w", err)
 	}
 	var check struct {
 		IsSafe *bool `json:"is_safe"`
+		Score  *int  `json:"score"`
 	}
-	if checkErr := json.Unmarshal([]byte(content), &check); checkErr != nil || check.IsSafe == nil || result.Score < 0 || result.Score > 100 || strings.TrimSpace(result.Summary) == "" || strings.TrimSpace(result.Tip) == "" {
+	if checkErr := json.Unmarshal([]byte(content), &check); checkErr != nil || check.IsSafe == nil || check.Score == nil || result.Score < 0 || result.Score > 100 || strings.TrimSpace(result.Summary) == "" || strings.TrimSpace(result.Tip) == "" {
 		return models.AnalyzeResponse{}, fmt.Errorf("incomplete AI analysis")
 	}
 	result.IsSafe = result.Score >= 70
@@ -153,29 +231,10 @@ func (s *AIService) chat(ctx context.Context, body []byte) (string, error) {
 		return "", err
 	}
 	defer res.Body.Close()
-	responseBody, err := io.ReadAll(res.Body)
-	if err != nil {
-		return "", err
-	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("AI returned status %d: %s", res.StatusCode, truncate(string(responseBody), 500))
+		return "", fmt.Errorf("AI returned status %d", res.StatusCode)
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(responseBody, &raw); err != nil {
-		return "", err
-	}
-	content := extractContent(raw)
-	if strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("AI response has no message content")
-	}
-	return content, nil
-}
-
-func truncate(value string, limit int) string {
-	if len(value) <= limit {
-		return value
-	}
-	return value[:limit] + "..."
+	return readAIResponse(res, nil)
 }
 
 // Some compatible gateways return a complete JSON response even when stream is

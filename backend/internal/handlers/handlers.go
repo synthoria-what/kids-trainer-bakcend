@@ -205,7 +205,7 @@ func (h *Handler) GenerateTasks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load task examples"})
 		return
 	}
-	generated, err := h.AI.GenerateTasks(c, examples, in)
+	generated, err := h.AI.GenerateTasks(c.Request.Context(), examples, in)
 	if err != nil {
 		log.Printf("generate tasks: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "task generation failed"})
@@ -286,7 +286,7 @@ func (h *Handler) Analyze(c *gin.Context) {
 			return
 		}
 	}
-	result, err := h.AI.Analyze(c, task, in.Answer)
+	result, err := h.AI.Analyze(c.Request.Context(), task, in.Answer)
 	if err != nil {
 		log.Printf("AI analysis: task_id=%d: %v", in.TaskID, err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "AI analysis failed"})
@@ -328,6 +328,7 @@ func (h *Handler) AnalyzeStream(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -340,7 +341,13 @@ func (h *Handler) AnalyzeStream(c *gin.Context) {
 		flusher.Flush()
 		return err
 	}
-	result, err := h.AI.AnalyzeStream(c, task, in.Answer, emit)
+	flusher.Flush()
+	reset := func() error {
+		_, err := c.Writer.Write([]byte("event: reset\ndata: {}\n\n"))
+		flusher.Flush()
+		return err
+	}
+	result, err := h.AI.AnalyzeStream(c.Request.Context(), task, in.Answer, emit, reset)
 	if err != nil {
 		log.Printf("AI streaming analysis: task_id=%d: %v", in.TaskID, err)
 		payload := gin.H{"message": "AI analysis failed"}
@@ -352,6 +359,8 @@ func (h *Handler) AnalyzeStream(c *gin.Context) {
 	safe := result.Evaluated && result.IsSafe
 	if err = h.Activity.Submit(c, models.TaskAttempt{ChildID: middleware.UserID(c), TaskID: in.TaskID, Answer: in.Answer, Mode: in.Mode, AiIsSafe: &safe, AiSummary: result.Summary, AiTip: result.Tip, AiIsDemo: result.IsDemo}); err != nil {
 		log.Printf("save streamed attempt: %v", err)
+		_, _ = c.Writer.Write([]byte("event: error\ndata: {\"message\":\"could not save attempt\"}\n\n"))
+		flusher.Flush()
 		return
 	}
 	encoded, _ := json.Marshal(result)

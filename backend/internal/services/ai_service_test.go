@@ -105,3 +105,112 @@ func TestReadAIResponseStopsOnEmitError(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzeProviderFailover(t *testing.T) {
+	const valid = `{"is_safe":true,"score":90,"summary":"Резервный ответ","tip":"Совет"}`
+	for _, mode := range []string{"success", "http", "empty", "invalid", "partial", "timeout", "both fail", "canceled", "emit error", "reset error", "fallback only"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.Config{AIURL: "https://primary.example", AIToken: "primary-token", AIModel: "primary-model",
+				AIFallbackURL: "https://backup.example", AIFallbackToken: "backup-token", AIFallbackModel: "backup-model", AIAnalyzeTimeout: 10 * time.Millisecond}
+			if mode == "fallback only" {
+				cfg.AIToken = ""
+			}
+			svc := NewAIService(cfg)
+			var calls []string
+			svc.client.Transport = aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls = append(calls, r.URL.Host)
+				var payload map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&payload)
+				token, model := "primary-token", "primary-model"
+				if r.URL.Host == "backup.example" {
+					token, model = "backup-token", "backup-model"
+				}
+				if r.Header.Get("Authorization") != "Bearer "+token || payload["model"] != model {
+					t.Fatal("wrong provider credentials or model")
+				}
+				status, body := 200, ""
+				if r.URL.Host == "primary.example" {
+					switch mode {
+					case "http", "both fail":
+						status = 503
+					case "invalid":
+						body = "data: {broken}\n\n"
+					case "partial", "emit error", "reset error":
+						body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n"
+					case "timeout":
+						<-r.Context().Done()
+						return nil, r.Context().Err()
+					}
+				}
+				if mode == "success" || r.URL.Host == "backup.example" {
+					data, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": valid}}}})
+					body = string(data)
+				}
+				if mode == "both fail" {
+					status = 503
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "canceled" {
+				cancel()
+			}
+			preview, resets := "", 0
+			result, err := svc.AnalyzeStream(ctx, models.SafetyTask{}, "Ответ", func(piece string) error {
+				if mode == "emit error" {
+					return errors.New("disconnected")
+				}
+				preview += piece
+				return nil
+			}, func() error {
+				resets++
+				preview = ""
+				if mode == "reset error" {
+					return errors.New("disconnected")
+				}
+				return nil
+			})
+			wantCalls := 2
+			if mode == "canceled" {
+				wantCalls = 0
+			} else if mode == "success" || mode == "emit error" || mode == "reset error" || mode == "fallback only" {
+				wantCalls = 1
+			}
+			if len(calls) != wantCalls {
+				t.Fatalf("calls=%v want %d", calls, wantCalls)
+			}
+			if mode == "both fail" || mode == "canceled" || mode == "emit error" || mode == "reset error" {
+				if err == nil || result.Evaluated {
+					t.Fatalf("expected failure, got %+v %v", result, err)
+				}
+				return
+			}
+			if err != nil || !result.Evaluated || preview != valid {
+				t.Fatalf("result=%+v error=%v preview=%q", result, err, preview)
+			}
+			if (mode == "partial") != (resets == 1) {
+				t.Fatalf("unexpected resets: %d", resets)
+			}
+		})
+	}
+}
+
+func TestGenerateTasksFailover(t *testing.T) {
+	svc := NewAIService(&config.Config{AIURL: "https://primary.example", AIToken: "a", AIModel: "a",
+		AIFallbackURL: "https://backup.example", AIFallbackToken: "b", AIFallbackModel: "b"})
+	calls := 0
+	svc.client.Transport = aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		content := `{"tasks":[]}` // A structurally valid but unusable primary answer.
+		if r.URL.Host == "backup.example" {
+			content = `{"tasks":[{"title":"Новое задание"}]}`
+		}
+		body, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": content}}}})
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+	})
+	tasks, err := svc.GenerateTasks(context.Background(), nil, models.GenerateTasksRequest{Count: 1})
+	if err != nil || len(tasks) != 1 || calls != 2 {
+		t.Fatalf("tasks=%v calls=%d err=%v", tasks, calls, err)
+	}
+}
