@@ -22,6 +22,9 @@ type AIService struct {
 }
 
 func NewAIService(cfg *config.Config) *AIService {
+	log.Printf("AI configuration: primary_configured=%t fallback_configured=%t",
+		cfg.AIURL != "" && cfg.AIToken != "" && cfg.AIModel != "",
+		cfg.AIFallbackURL != "" && cfg.AIFallbackToken != "" && cfg.AIFallbackModel != "")
 	return &AIService{cfg: cfg, client: &http.Client{Timeout: cfg.AITimeout}}
 }
 
@@ -45,8 +48,10 @@ func (s *AIService) GenerateTasks(ctx context.Context, examples []models.SafetyT
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		log.Printf("AI task generation: provider_attempt=%d status=started", i+1)
 		tasks, err := provider.generateTasks(ctx, examples, in)
 		if err == nil {
+			log.Printf("AI task generation: provider_attempt=%d status=success", i+1)
 			return tasks, nil
 		}
 		log.Printf("AI task generation: provider_attempt=%d: %v", i+1, err)
@@ -118,6 +123,11 @@ func (s *AIService) AnalyzeStream(ctx context.Context, task models.SafetyTask, a
 func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer string, emit func(string) error, reset ...func() error) (models.AnalyzeResponse, error) {
 	providers := s.providers()
 	if contains(task.Choices, answer) || len(providers) == 0 {
+		reason := "no_provider_configured"
+		if contains(task.Choices, answer) {
+			reason = "choice_answer"
+		}
+		log.Printf("AI analysis: source=local reason=%s", reason)
 		result := fallback(task, answer)
 		if emit != nil {
 			body, _ := json.Marshal(result)
@@ -142,8 +152,10 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 				return emitErr
 			}
 		}
+		log.Printf("AI analysis: provider_attempt=%d status=started", i+1)
 		result, err := provider.analyzeOnce(ctx, task, answer, forward)
 		if err == nil {
+			log.Printf("AI analysis: provider_attempt=%d status=success", i+1)
 			return result, nil
 		}
 		if emitErr != nil {
