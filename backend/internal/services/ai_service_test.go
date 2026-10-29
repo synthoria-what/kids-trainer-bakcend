@@ -254,3 +254,32 @@ func TestIndependentProviderAnalysisDeadlines(t *testing.T) {
 		}
 	}
 }
+
+func TestIndependentProviderTokenBudgets(t *testing.T) {
+	cfg := &config.Config{AIURL: "https://primary.example", AIToken: "a", AIModel: "a",
+		AIFallbackURL: "https://backup.example", AIFallbackToken: "b", AIFallbackModel: "b",
+		AIAnalyzeMaxTokens: 1024, AIFallbackAnalyzeMaxTokens: 4096}
+	svc := NewAIService(cfg)
+	calls := 0
+	svc.client.Transport = aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		want, status, body := float64(1024), 500, ""
+		if r.URL.Host == "backup.example" {
+			want, status = 4096, 200
+			data, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": `{"is_safe":true,"score":90,"summary":"Ответ","tip":"Совет"}`}}}})
+			body = string(data)
+		}
+		if payload["max_tokens"] != want {
+			t.Fatalf("%s: max_tokens=%v, want %v", r.URL.Host, payload["max_tokens"], want)
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	result, err := svc.Analyze(context.Background(), models.SafetyTask{}, "Ответ")
+	if err != nil || !result.Evaluated || calls != 2 || cfg.AIAnalyzeMaxTokens != 1024 {
+		t.Fatalf("result=%+v err=%v calls=%d", result, err, calls)
+	}
+}

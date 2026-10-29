@@ -41,6 +41,9 @@ func (s *AIService) providers() []*AIService {
 		if cfg.AIFallbackAnalyzeTimeout > 0 {
 			cfg.AIAnalyzeTimeout = cfg.AIFallbackAnalyzeTimeout
 		}
+		if cfg.AIFallbackAnalyzeMaxTokens > 0 {
+			cfg.AIAnalyzeMaxTokens = cfg.AIFallbackAnalyzeMaxTokens
+		}
 		providers = append(providers, &AIService{cfg: &cfg, client: s.client})
 	}
 	return providers
@@ -156,7 +159,7 @@ func (s *AIService) analyze(ctx context.Context, task models.SafetyTask, answer 
 				return emitErr
 			}
 		}
-		log.Printf("AI analysis: provider_attempt=%d status=started", i+1)
+		log.Printf("AI analysis: provider_attempt=%d status=started max_tokens=%d", i+1, provider.analysisMaxTokens())
 		result, err := provider.analyzeOnce(ctx, task, answer, forward)
 		if err == nil {
 			log.Printf("AI analysis: provider_attempt=%d status=success", i+1)
@@ -190,7 +193,7 @@ func (s *AIService) analyzeOnce(ctx context.Context, task models.SafetyTask, ans
 	}
 	payload := map[string]any{
 		"model": s.cfg.AIModel, "temperature": 0.0, "top_p": 1.0,
-		"max_tokens": 1024, "stream": emit != nil,
+		"max_tokens": s.analysisMaxTokens(), "stream": emit != nil,
 		"response_format": map[string]string{"type": "json_object"},
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
@@ -235,6 +238,14 @@ func (s *AIService) analyzeOnce(ctx context.Context, task models.SafetyTask, ans
 	result.Evaluated = true
 	return result, nil
 }
+
+func (s *AIService) analysisMaxTokens() int {
+	if s.cfg.AIAnalyzeMaxTokens > 0 {
+		return s.cfg.AIAnalyzeMaxTokens
+	}
+	return 1024
+}
+
 func (s *AIService) chat(ctx context.Context, body []byte) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AIURL, bytes.NewReader(body))
 	if err != nil {
@@ -431,6 +442,7 @@ func analysisPrompt(task models.SafetyTask, answer string) string {
 Ответ ребёнка: %q
 Сравни ответ с эталоном и самостоятельно проверь реалистичность и безопасность. Безопасный логичный вариант вне базы тоже может получить высокий балл. Фантастические действия оцени максимум в 20%%.
 Верни только JSON: {"is_safe":bool,"score":integer 0..100,"summary":"понятная ребёнку обратная связь","tip":"конкретное правило или улучшение"}.
+Поля summary и tip — каждое по одному короткому предложению, не более 20 слов. Не добавляй другие поля, вступление или повтор ситуации.
 70–100: похвали и объясни успех. 30–69: похвали попытку и объясни улучшение. 0–29: спокойно объясни риск без страшных подробностей и дай лучший алгоритм.
 Никогда не описывай кровь, увечья, смерть или физиологически отталкивающие детали.`, base, answer)
 }

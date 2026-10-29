@@ -10,23 +10,25 @@ import (
 )
 
 type Config struct {
-	AdminLogin               string
-	AdminPassword            string
-	DevMode                  bool
-	HTTPAddr                 string
-	DatabasePath             string
-	JWTSecret                string
-	JWTTL                    time.Duration
-	CORSOrigins              []string
-	AIURL                    string
-	AIToken                  string
-	AIModel                  string
-	AIFallbackURL            string
-	AIFallbackToken          string
-	AIFallbackModel          string
-	AITimeout                time.Duration
-	AIAnalyzeTimeout         time.Duration
-	AIFallbackAnalyzeTimeout time.Duration
+	AdminLogin                 string
+	AdminPassword              string
+	DevMode                    bool
+	HTTPAddr                   string
+	DatabasePath               string
+	JWTSecret                  string
+	JWTTL                      time.Duration
+	CORSOrigins                []string
+	AIURL                      string
+	AIToken                    string
+	AIModel                    string
+	AIFallbackURL              string
+	AIFallbackToken            string
+	AIFallbackModel            string
+	AITimeout                  time.Duration
+	AIAnalyzeTimeout           time.Duration
+	AIFallbackAnalyzeTimeout   time.Duration
+	AIAnalyzeMaxTokens         int
+	AIFallbackAnalyzeMaxTokens int
 }
 
 func Load() (*Config, error) {
@@ -70,6 +72,20 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("AI_FALLBACK_ANALYZE_TIMEOUT_SECONDS must be a positive integer")
 	}
 	cfg.AIFallbackAnalyzeTimeout = time.Duration(fallbackTimeout) * time.Second
+	for _, setting := range []struct {
+		key          string
+		defaultValue string
+		target       *int
+	}{
+		{"AI_ANALYZE_MAX_TOKENS", "1024", &cfg.AIAnalyzeMaxTokens},
+		{"AI_FALLBACK_ANALYZE_MAX_TOKENS", "4096", &cfg.AIFallbackAnalyzeMaxTokens},
+	} {
+		value, err := strconv.Atoi(getEnv(setting.key, setting.defaultValue))
+		if err != nil || value <= 0 {
+			return nil, fmt.Errorf("%s must be a positive integer", setting.key)
+		}
+		*setting.target = value
+	}
 	return cfg, nil
 }
 
