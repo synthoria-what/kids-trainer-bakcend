@@ -218,6 +218,48 @@ func (r TaskRepo) scanRandomTask(ctx context.Context, q string, args ...any) (mo
 	return t, json.Unmarshal([]byte(choices), &t.Choices)
 }
 
+// NextForChildBatch returns several untried tasks at once, so the home
+// screen can offer a small carousel instead of one random task per refresh.
+func (r TaskRepo) NextForChildBatch(ctx context.Context, childID int, category, difficulty, mode string, limit int) ([]models.SafetyTask, error) {
+	if limit < 1 {
+		limit = 5
+	}
+	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
+	args := []any{childID}
+	if category != "" {
+		q += " AND category=?"
+		args = append(args, category)
+	}
+	if difficulty != "" {
+		q += " AND difficulty=?"
+		args = append(args, difficulty)
+	}
+	if mode != "" {
+		q += " AND answer_mode=?"
+		args = append(args, mode)
+	}
+	q += " ORDER BY RANDOM() LIMIT ?"
+	args = append(args, limit)
+	rows, err := r.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []models.SafetyTask{}
+	for rows.Next() {
+		var t models.SafetyTask
+		var choices string
+		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 type ActivityRepo struct{ DB *sql.DB }
 
 func (r ActivityRepo) Record(ctx context.Context, childID int, completed bool) error {

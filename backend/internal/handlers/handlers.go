@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -241,6 +242,16 @@ func (h *Handler) GenerateTasks(c *gin.Context) {
 }
 
 func (h *Handler) NextTask(c *gin.Context) {
+	countStr := c.Query("count")
+	if count, err := strconv.Atoi(countStr); err == nil && count > 1 {
+		tasks, err := h.Tasks.NextForChildBatch(c, middleware.UserID(c), c.Query("category"), c.Query("difficulty"), c.Query("mode"), count)
+		if err != nil || len(tasks) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no tasks available"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"tasks": tasks})
+		return
+	}
 	task, err := h.Tasks.NextForChild(c, middleware.UserID(c), c.Query("category"), c.Query("difficulty"), c.Query("mode"))
 	if err != nil {
 		// After the child completes the current pool, refresh should still offer

@@ -190,3 +190,35 @@ func TestFreeTextWithoutAIIsNotCountedAsCompleted(t *testing.T) {
 		t.Fatal(p)
 	}
 }
+
+func TestNextTaskBatchSupportsFiltersAndExcludesAttempted(t *testing.T) {
+	f := setup(t)
+	child := f.account("batch-child", "child")
+	parent := f.account("batch-parent", "parent")
+	path := "/child/tasks/next?count=5&category=city&difficulty=easy&mode=free"
+	f.call("GET", path, parent, nil, 403)
+	batch := f.call("GET", path, child, nil, 200)["tasks"].([]any)
+	if len(batch) < 2 || len(batch) > 5 {
+		t.Fatalf("expected 2 to 5 tasks, got %d", len(batch))
+	}
+	seen := map[float64]bool{}
+	for _, value := range batch {
+		task := value.(map[string]any)
+		id := task["id"].(float64)
+		if seen[id] || task["category"] != "city" || task["difficulty"] != "easy" || task["answer_mode"] != "free" {
+			t.Fatalf("duplicate task or ignored filter: %v", task)
+		}
+		seen[id] = true
+	}
+	attempted := batch[0].(map[string]any)["id"].(float64)
+	_, err := f.h.Tasks.DB.Exec(`INSERT INTO task_attempts(child_id,task_id,answer,mode) SELECT id,?,'answer','free' FROM users WHERE login='batch-child'`, int(attempted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch = f.call("GET", path, child, nil, 200)["tasks"].([]any)
+	for _, value := range batch {
+		if value.(map[string]any)["id"] == attempted {
+			t.Fatal("completed task returned in batch")
+		}
+	}
+}
