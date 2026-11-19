@@ -72,6 +72,7 @@ type TaskAttempt struct {
 	Answer    string     `json:"answer"`
 	Mode      AnswerMode `json:"mode"`
 	AiIsSafe  *bool      `json:"ai_is_safe"`
+	AiScore   *int       `json:"ai_score"`
 	AiSummary string     `json:"ai_summary"`
 	AiTip     string     `json:"ai_tip"`
 	AiIsDemo  bool       `json:"ai_is_demo"`
@@ -114,7 +115,8 @@ type LoginResponse struct {
 }
 
 type ChildJoinRequest struct {
-	Code string `json:"code"`
+	Code    string `json:"code"`
+	Replace bool   `json:"replace"`
 }
 
 type ChildOnboardingRequest struct {
@@ -175,4 +177,23 @@ type ProgressResponse struct {
 	Streak           int            `json:"streak"`
 	ByCategory       map[string]int `json:"by_category"`
 	CompletedDays    []int          `json:"completed_days"`
+	Platinum         bool           `json:"platinum,omitempty"`
+	Global           *GlobalStats   `json:"global,omitempty"`
+}
+
+type GlobalStats struct {
+	Players   int  `json:"players"`
+	Completed int  `json:"completed"`
+	Rank      *int `json:"rank,omitempty"`
+}
+
+type ChildActivity struct {
+	Name           string         `json:"name"`
+	CompletedToday int            `json:"completed_today"`
+	TotalCompleted int            `json:"total_completed"`
+	Streak         int            `json:"streak"`
+	ByCategory     map[string]int `json:"by_category"`
+	CompletedDays  []int          `json:"completed_days"`
+	EvaluatedTasks int            `json:"evaluated_tasks"`
+	AverageScore   *int           `json:"average_score"`
 }

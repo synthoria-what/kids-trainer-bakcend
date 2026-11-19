@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,6 +177,57 @@ func TestInvitationConsumesOnlyItsOwnCodeAndParentSeesCounts(t *testing.T) {
 		if _, exists := p[key]; exists {
 			t.Fatal("parent can read non-count data", key)
 		}
+	}
+	stats := p["children"].([]any)
+	if len(stats) != 2 || stats[0].(map[string]any)["average_score"] != float64(100) {
+		t.Fatal(p)
+	}
+	wrong := task["choices"].([]any)[0]
+	f.call("POST", "/child/analyze", child1, map[string]any{"task_id": task["id"], "answer": wrong, "mode": "choices"}, 200)
+	p = f.call("GET", "/parent/activity", parent, nil, 200)
+	first := p["children"].([]any)[0].(map[string]any)
+	if first["average_score"] != float64(0) || first["evaluated_tasks"] != float64(1) || first["total_completed"] != float64(1) {
+		t.Fatal(first)
+	}
+	for _, key := range []string{"answer", "attempts", "ai_summary", "completed_task_ids"} {
+		if _, exists := first[key]; exists {
+			t.Fatal("parent can read private attempt data", key)
+		}
+	}
+	other := f.account("other-parent", "parent")
+	code := f.call("POST", "/parent/invites", other, nil, 201)["code"].(string)
+	f.call("POST", "/child/join", child1, map[string]any{"code": code}, 409)
+	f.call("POST", "/child/join", child1, map[string]any{"code": strings.ToLower(code), "replace": true}, 200)
+	if p = f.call("GET", "/parent/activity", parent, nil, 200); p["total_completed"] != float64(1) {
+		t.Fatal(p)
+	}
+}
+
+func TestPlatinumAndGlobalStatsUseUniqueCompletedMissions(t *testing.T) {
+	f := setup(t)
+	child := f.account("platinum-child", "child")
+	other := f.account("ranking-child", "child")
+	id := f.call("GET", "/me", child, nil, 200)["id"]
+	catalog := f.call("GET", "/tasks", child, nil, 200)["tasks"].([]any)
+	task := catalog[0].(map[string]any)
+	if _, err := f.h.Tasks.DB.Exec(`INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe) SELECT ?,id,'fixture','free',1 FROM tasks WHERE id<>?`, id, task["id"]); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.call("GET", "/child/progress", child, nil, 200); p["platinum"] == true {
+		t.Fatal(p)
+	}
+	answer := map[string]any{"task_id": task["id"], "answer": task["choices"].([]any)[1], "mode": "choices"}
+	for _, token := range []string{child, child, other} {
+		f.call("POST", "/child/analyze", token, answer, 200)
+	}
+	f.call("POST", "/admin/tasks", f.admin(), taskPayload(), 201)
+	p := f.call("GET", "/child/progress", child, nil, 200)
+	g := p["global"].(map[string]any)
+	if p["platinum"] != true || g["players"] != float64(2) || g["rank"] != float64(1) || g["completed"] != float64(len(catalog)+1) {
+		t.Fatal(p)
+	}
+	if p = f.call("GET", "/child/progress", other, nil, 200); p["global"].(map[string]any)["rank"] != float64(2) {
+		t.Fatal(p)
 	}
 }
 func TestFreeTextWithoutAIIsNotCountedAsCompleted(t *testing.T) {

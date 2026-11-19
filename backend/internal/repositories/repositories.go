@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,39 +51,42 @@ func (r UserRepo) UpdateProfile(ctx context.Context, userID int, name string, ag
 	_, err := r.DB.ExecContext(ctx, `INSERT INTO child_profiles(user_id,name,age) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,age=excluded.age`, userID, name, age)
 	return err
 }
-func (r UserRepo) LinkParent(ctx context.Context, childID int, codeHash string) error {
+
+var ErrParentAlreadyLinked = errors.New("child is linked to another parent")
+
+func (r UserRepo) LinkParent(ctx context.Context, childID int, codeHash string, replace bool) (string, error) {
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
 	var inviteID, parentID int
-	if err = tx.QueryRowContext(ctx, `SELECT id,parent_id FROM invite_codes WHERE code_hash=? AND used_by IS NULL AND expires_at>?`, codeHash, time.Now()).Scan(&inviteID, &parentID); err != nil {
-		return err
+	var parentName string
+	if err = tx.QueryRowContext(ctx, `SELECT i.id,i.parent_id,u.name FROM invite_codes i JOIN users u ON i.parent_id=u.id WHERE i.code_hash=? AND i.used_by IS NULL AND i.expires_at>?`, codeHash, time.Now()).Scan(&inviteID, &parentID, &parentName); err != nil {
+		return "", err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE child_profiles SET parent_id=? WHERE user_id=?`, parentID, childID)
+	var currentParent sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT parent_id FROM child_profiles WHERE user_id=?`, childID).Scan(&currentParent); err != nil {
+		return "", err
+	}
+	if currentParent.Valid && currentParent.Int64 != int64(parentID) && !replace {
+		return "", ErrParentAlreadyLinked
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE child_profiles SET parent_id=? WHERE user_id=?`, parentID, childID); err != nil {
+		return "", err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE invite_codes SET used_by=? WHERE id=? AND used_by IS NULL`, childID, inviteID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if n != 1 {
-		return sql.ErrNoRows
+		return "", sql.ErrNoRows
 	}
-	res, err = tx.ExecContext(ctx, `UPDATE invite_codes SET used_by=? WHERE id=? AND used_by IS NULL`, childID, inviteID)
-	if err != nil {
-		return err
-	}
-	n, err = res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return sql.ErrNoRows
-	}
-	return tx.Commit()
+	return parentName, tx.Commit()
 }
 func (r UserRepo) Profile(ctx context.Context, userID int) (models.ChildProfile, error) {
 	var p models.ChildProfile
@@ -93,19 +97,19 @@ func (r UserRepo) Profile(ctx context.Context, userID int) (models.ChildProfile,
 	}
 	return p, err
 }
-func (r UserRepo) Children(ctx context.Context, parentID int) ([]int, error) {
-	rows, err := r.DB.QueryContext(ctx, `SELECT user_id FROM child_profiles WHERE parent_id=?`, parentID)
+func (r UserRepo) Children(ctx context.Context, parentID int) ([]models.ChildProfile, error) {
+	rows, err := r.DB.QueryContext(ctx, `SELECT user_id,name FROM child_profiles WHERE parent_id=? ORDER BY user_id`, parentID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []int{}
+	out := []models.ChildProfile{}
 	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
+		var child models.ChildProfile
+		if err := rows.Scan(&child.UserID, &child.Name); err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		out = append(out, child)
 	}
 	return out, rows.Err()
 }
@@ -288,7 +292,7 @@ func (r ActivityRepo) Attempt(ctx context.Context, a models.TaskAttempt) error {
 	if a.AiIsSafe != nil {
 		aiIsSafe = *a.AiIsSafe
 	}
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, aiIsSafe, a.AiSummary, a.AiTip, a.AiIsDemo)
+	_, err := r.DB.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_score,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, aiIsSafe, a.AiScore, a.AiSummary, a.AiTip, a.AiIsDemo)
 	return err
 }
 func (r ActivityRepo) Progress(ctx context.Context, childID int) (models.ProgressResponse, error) {
@@ -374,6 +378,56 @@ func (r ActivityRepo) Progress(ctx context.Context, childID int) (models.Progres
 	return p, nil
 }
 
+func (r ActivityRepo) Scores(ctx context.Context, childID int) (count int, average *int, err error) {
+	var score sql.NullInt64
+	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*), CAST(ROUND(AVG(ai_score)) AS INTEGER) FROM task_attempts WHERE id IN (
+		SELECT MAX(id) FROM task_attempts WHERE child_id=? AND ai_score IS NOT NULL GROUP BY task_id
+	)`, childID).Scan(&count, &score)
+	if score.Valid {
+		value := int(score.Int64)
+		average = &value
+	}
+	return
+}
+
+func (r ActivityRepo) GlobalStats(ctx context.Context, childID int) (models.GlobalStats, error) {
+	var stats models.GlobalStats
+	var rank sql.NullInt64
+	err := r.DB.QueryRowContext(ctx, `WITH solved AS (
+		SELECT child_id,COUNT(DISTINCT task_id) AS total FROM task_attempts WHERE ai_is_safe=1 GROUP BY child_id
+	), own AS (SELECT total FROM solved WHERE child_id=?)
+	SELECT COUNT(*),COALESCE(SUM(total),0),
+		(SELECT 1+(SELECT COUNT(*) FROM solved WHERE total > own.total) FROM own)
+	FROM solved`, childID).Scan(&stats.Players, &stats.Completed, &rank)
+	if rank.Valid && rank.Int64 > 0 {
+		value := int(rank.Int64)
+		stats.Rank = &value
+	}
+	return stats, err
+}
+
+const grantPlatinumSQL = `INSERT INTO platinum_awards(child_id) SELECT ?
+	WHERE EXISTS (SELECT 1 FROM tasks) AND NOT EXISTS (
+		SELECT 1 FROM tasks t WHERE NOT EXISTS (
+			SELECT 1 FROM task_attempts a WHERE a.child_id=? AND a.task_id=t.id AND a.ai_is_safe=1
+		)
+	) ON CONFLICT(child_id) DO NOTHING`
+
+func (r ActivityRepo) Platinum(ctx context.Context, childID int, completed int) (bool, error) {
+	var earned bool
+	var total int
+	err := r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platinum_awards WHERE child_id=?),(SELECT COUNT(*) FROM tasks)`, childID).Scan(&earned, &total)
+	if err != nil || earned || total == 0 || completed < total {
+		return earned, err
+	}
+	// Backfill eligible progress from before the award was introduced.
+	if _, err = r.DB.ExecContext(ctx, grantPlatinumSQL, childID, childID); err != nil {
+		return false, err
+	}
+	err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platinum_awards WHERE child_id=?)`, childID).Scan(&earned)
+	return earned, err
+}
+
 type InviteRepo struct{ DB *sql.DB }
 
 func (r InviteRepo) Create(ctx context.Context, parentID int, hash string, expires time.Time) (models.InviteCode, error) {
@@ -440,12 +494,15 @@ func (r ActivityRepo) Submit(ctx context.Context, a models.TaskAttempt) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, a.AiIsSafe, a.AiSummary, a.AiTip, a.AiIsDemo); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_score,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, a.AiIsSafe, a.AiScore, a.AiSummary, a.AiTip, a.AiIsDemo); err != nil {
 		return err
 	}
 	increment := 0
 	if a.AiIsSafe != nil && *a.AiIsSafe {
 		increment = 1
+		if _, err = tx.ExecContext(ctx, grantPlatinumSQL, a.ChildID, a.ChildID); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO daily_activity(child_id,activity_date,completed_count) VALUES(?,?,?) ON CONFLICT(child_id,activity_date) DO UPDATE SET completed_count=completed_count+excluded.completed_count`, a.ChildID, time.Now().Format("2006-01-02"), increment); err != nil {
 		return err

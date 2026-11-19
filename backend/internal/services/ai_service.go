@@ -412,15 +412,17 @@ func extractContent(data map[string]any) string {
 func fallback(task models.SafetyTask, answer string) models.AnalyzeResponse {
 	evaluated := task.CorrectChoice != nil && *task.CorrectChoice >= 0 && *task.CorrectChoice < len(task.Choices) && contains(task.Choices, answer)
 	safe := evaluated && task.Choices[*task.CorrectChoice] == answer
+	score := 0
 	summary := "Сравни своё решение с примером безопасных действий. Персональная оценка сейчас недоступна."
 	if evaluated {
 		if safe {
+			score = 100
 			summary = "Это безопасный вариант для этой ситуации."
 		} else {
 			summary = "Давай посмотрим на более безопасный вариант."
 		}
 	}
-	return models.AnalyzeResponse{IsSafe: safe, IsDemo: true, Evaluated: evaluated, Summary: summary, Tip: task.SafetyTip}
+	return models.AnalyzeResponse{IsSafe: safe, Score: score, IsDemo: true, Evaluated: evaluated, Summary: summary, Tip: task.SafetyTip}
 }
 func contains(values []string, target string) bool {
 	for _, v := range values {

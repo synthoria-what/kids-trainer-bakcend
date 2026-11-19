@@ -88,11 +88,25 @@ CREATE TABLE IF NOT EXISTS daily_activity (
  activity_date TEXT NOT NULL, completed_count INTEGER NOT NULL DEFAULT 0,
  UNIQUE(child_id, activity_date)
 );
+CREATE TABLE IF NOT EXISTS platinum_awards (
+ child_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ awarded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_attempt_child_date ON task_attempts(child_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attempt_solved ON task_attempts(child_id, task_id) WHERE ai_is_safe=1;
 CREATE INDEX IF NOT EXISTS idx_activity_child_date ON daily_activity(child_id, activity_date);
 `)
 	if err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+	var scoreColumns int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('task_attempts') WHERE name='ai_score'`).Scan(&scoreColumns); err != nil {
+		return err
+	}
+	if scoreColumns == 0 {
+		if _, err := db.Exec(`ALTER TABLE task_attempts ADD COLUMN ai_score INTEGER CHECK(ai_score BETWEEN 0 AND 100)`); err != nil {
+			return err
+		}
 	}
 	// Versioned additive migration keeps existing installations and task edits intact.
 	var columns int

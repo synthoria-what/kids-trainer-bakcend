@@ -102,6 +102,12 @@ func (h *Handler) Me(c *gin.Context) {
 		p, err := h.Users.Profile(c, u.ID)
 		if err == nil {
 			out["child_profile"] = p
+			if p.ParentID != 0 {
+				parent, err := h.Users.ByID(c, p.ParentID)
+				if err == nil {
+					out["linked_parent_name"] = parent.Name
+				}
+			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load profile"})
 			return
@@ -168,7 +174,12 @@ func (h *Handler) Join(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
 		return
 	}
-	err := h.Users.LinkParent(c, middleware.UserID(c), auth.HashCode(strings.TrimSpace(in.Code)))
+	code := strings.ToUpper(strings.TrimSpace(in.Code))
+	parentName, err := h.Users.LinkParent(c, middleware.UserID(c), auth.HashCode(code), in.Replace)
+	if errors.Is(err, repositories.ErrParentAlreadyLinked) {
+		c.JSON(http.StatusConflict, gin.H{"error": "child is linked to another parent"})
+		return
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "code is invalid or expired"})
 		return
@@ -177,7 +188,7 @@ func (h *Handler) Join(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not link accounts"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "parent_name": parentName})
 }
 
 func (h *Handler) TasksList(c *gin.Context) {
@@ -303,8 +314,7 @@ func (h *Handler) Analyze(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "AI analysis failed"})
 		return
 	}
-	safe := result.Evaluated && result.IsSafe
-	if err = h.Activity.Submit(c, models.TaskAttempt{ChildID: middleware.UserID(c), TaskID: in.TaskID, Answer: in.Answer, Mode: in.Mode, AiIsSafe: &safe, AiSummary: result.Summary, AiTip: result.Tip, AiIsDemo: result.IsDemo}); err != nil {
+	if err = h.saveAnalysis(c, in, result); err != nil {
 		log.Printf("save attempt: child_id=%d task_id=%d: %v", middleware.UserID(c), in.TaskID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save attempt"})
 		return
@@ -367,8 +377,7 @@ func (h *Handler) AnalyzeStream(c *gin.Context) {
 		flusher.Flush()
 		return
 	}
-	safe := result.Evaluated && result.IsSafe
-	if err = h.Activity.Submit(c, models.TaskAttempt{ChildID: middleware.UserID(c), TaskID: in.TaskID, Answer: in.Answer, Mode: in.Mode, AiIsSafe: &safe, AiSummary: result.Summary, AiTip: result.Tip, AiIsDemo: result.IsDemo}); err != nil {
+	if err = h.saveAnalysis(c, in, result); err != nil {
 		log.Printf("save streamed attempt: %v", err)
 		_, _ = c.Writer.Write([]byte("event: error\ndata: {\"message\":\"could not save attempt\"}\n\n"))
 		flusher.Flush()
@@ -388,12 +397,37 @@ func containsChoice(choices []string, answer string) bool {
 	return false
 }
 
+func (h *Handler) saveAnalysis(c *gin.Context, in models.AnalyzeRequest, result models.AnalyzeResponse) error {
+	safe := result.Evaluated && result.IsSafe
+	attempt := models.TaskAttempt{
+		ChildID: middleware.UserID(c), TaskID: in.TaskID, Answer: in.Answer, Mode: in.Mode,
+		AiIsSafe: &safe, AiSummary: result.Summary, AiTip: result.Tip, AiIsDemo: result.IsDemo,
+	}
+	if result.Evaluated {
+		score := min(100, max(0, result.Score))
+		attempt.AiScore = &score
+	}
+	return h.Activity.Submit(c, attempt)
+}
+
 func (h *Handler) Progress(c *gin.Context) {
-	p, err := h.Activity.Progress(c, middleware.UserID(c))
+	childID := middleware.UserID(c)
+	p, err := h.Activity.Progress(c, childID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load progress"})
 		return
 	}
+	p.Platinum, err = h.Activity.Platinum(c, childID, p.TotalCompleted)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load awards"})
+		return
+	}
+	global, err := h.Activity.GlobalStats(c, childID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load global activity"})
+		return
+	}
+	p.Global = &global
 	c.JSON(http.StatusOK, p)
 }
 func (h *Handler) ParentActivity(c *gin.Context) {
@@ -403,13 +437,24 @@ func (h *Handler) ParentActivity(c *gin.Context) {
 		return
 	}
 	p := models.ProgressResponse{ByCategory: map[string]int{}, CompletedDays: []int{}}
+	stats := make([]models.ChildActivity, 0, len(children))
 	days := map[int]bool{}
 	for _, child := range children {
-		v, err := h.Activity.Progress(c, child)
+		v, err := h.Activity.Progress(c, child.UserID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load activity"})
 			return
 		}
+		evaluated, average, err := h.Activity.Scores(c, child.UserID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load scores"})
+			return
+		}
+		stats = append(stats, models.ChildActivity{
+			Name: child.Name, CompletedToday: v.CompletedToday, TotalCompleted: v.TotalCompleted,
+			Streak: v.Streak, ByCategory: v.ByCategory, CompletedDays: v.CompletedDays,
+			EvaluatedTasks: evaluated, AverageScore: average,
+		})
 		p.CompletedToday += v.CompletedToday
 		p.TotalCompleted += v.TotalCompleted
 		if v.Streak > p.Streak {
@@ -427,7 +472,10 @@ func (h *Handler) ParentActivity(c *gin.Context) {
 			p.CompletedDays = append(p.CompletedDays, d)
 		}
 	}
-	c.JSON(http.StatusOK, p)
+	c.JSON(http.StatusOK, struct {
+		models.ProgressResponse
+		Children []models.ChildActivity `json:"children"`
+	}{p, stats})
 }
 
 func RegisterRoutes(r *gin.Engine, h *Handler) {
