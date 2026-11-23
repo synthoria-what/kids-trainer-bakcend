@@ -292,7 +292,7 @@ func (h *Handler) Analyze(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
 		return
 	}
-	if (in.Mode != models.ModeFree && in.Mode != models.ModeChoices) || len(in.Answer) > 12000 {
+	if (in.Mode != models.ModeFree && in.Mode != models.ModeChoices && in.Mode != models.ModeCardSort) || len(in.Answer) > 12000 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid answer mode"})
 		return
 	}
@@ -338,7 +338,7 @@ func (h *Handler) AnalyzeStream(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
 		return
 	}
-	if (in.Mode != models.ModeFree && in.Mode != models.ModeChoices) || len(in.Answer) > 12000 {
+	if (in.Mode != models.ModeFree && in.Mode != models.ModeChoices && in.Mode != models.ModeCardSort) || len(in.Answer) > 12000 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid answer mode"})
 		return
 	}

@@ -21,6 +21,7 @@ type datasetTask struct {
 	Description string   `json:"description"`
 	Prompt      string   `json:"prompt"`
 	Choices     []string `json:"choices"`
+	Steps       []string `json:"steps"`
 	Difficulty  string   `json:"difficulty"`
 	AnswerMode  string   `json:"answer_mode"`
 	SafetyTip   string   `json:"safety_tip"`
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS invite_codes (
 CREATE TABLE IF NOT EXISTS tasks (
  id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, scene TEXT NOT NULL, title TEXT NOT NULL,
  description TEXT NOT NULL, prompt TEXT NOT NULL, choices_json TEXT NOT NULL DEFAULT '[]', difficulty TEXT NOT NULL,
- answer_mode TEXT NOT NULL, safety_tip TEXT NOT NULL
+ answer_mode TEXT NOT NULL, safety_tip TEXT NOT NULL, steps_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS task_attempts (
  id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -139,6 +140,16 @@ CREATE INDEX IF NOT EXISTS idx_activity_child_date ON daily_activity(child_id, a
 			return err
 		}
 	}
+	// Migration: add steps_json column for card-sort tasks.
+	var stepsColumns int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='steps_json'`).Scan(&stepsColumns); err != nil {
+		return err
+	}
+	if stepsColumns == 0 {
+		if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return err
+		}
+	}
 	var seeded int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&seeded); err != nil {
 		return err
@@ -172,9 +183,18 @@ func seedDatasetTasks(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
-		if _, err := db.Exec(`INSERT INTO tasks(category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip)
-			SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE title=?)`,
-			task.Category, task.Scene, task.Title, task.Description, task.Prompt, string(choices), task.Difficulty, task.AnswerMode, task.SafetyTip, task.Title); err != nil {
+		steps, err := json.Marshal(task.Steps)
+		if err != nil {
+			return err
+		}
+		// Update existing rows so answer_mode/steps stay in sync with bundled data.
+		if _, err := db.Exec(`UPDATE tasks SET answer_mode=?, steps_json=? WHERE title=?`,
+			task.AnswerMode, string(steps), task.Title); err != nil {
+			return fmt.Errorf("update dataset task %q: %w", task.Title, err)
+		}
+		if _, err := db.Exec(`INSERT INTO tasks(category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,steps_json)
+			SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE title=?)`,
+			task.Category, task.Scene, task.Title, task.Description, task.Prompt, string(choices), task.Difficulty, task.AnswerMode, task.SafetyTip, string(steps), task.Title); err != nil {
 			return fmt.Errorf("seed dataset task %q: %w", task.Title, err)
 		}
 	}

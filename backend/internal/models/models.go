@@ -20,8 +20,9 @@ const (
 type AnswerMode string
 
 const (
-	ModeChoices AnswerMode = "choices"
-	ModeFree    AnswerMode = "free"
+	ModeChoices  AnswerMode = "choices"
+	ModeFree     AnswerMode = "free"
+	ModeCardSort AnswerMode = "card_sort"
 )
 
 type TaskDifficulty string
@@ -63,6 +64,7 @@ type SafetyTask struct {
 	Difficulty    TaskDifficulty `json:"difficulty"`
 	AnswerMode    AnswerMode     `json:"answer_mode"`
 	SafetyTip     string         `json:"safety_tip"`
+	Steps         []string       `json:"steps"`
 }
 
 type TaskAttempt struct {

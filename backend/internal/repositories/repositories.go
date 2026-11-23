@@ -129,7 +129,7 @@ func (r UserRepo) ChildParent(ctx context.Context, childID int) (int, error) {
 type TaskRepo struct{ DB *sql.DB }
 
 func (r TaskRepo) List(ctx context.Context, category, difficulty, mode string) ([]models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks WHERE 1=1`
+	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE 1=1`
 	args := []any{}
 	if category != "" {
 		q += " AND category=?"
@@ -152,30 +152,31 @@ func (r TaskRepo) List(ctx context.Context, category, difficulty, mode string) (
 	out := []models.SafetyTask{}
 	for rows.Next() {
 		var t models.SafetyTask
-		var choices string
-		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice); err != nil {
+		var choices, steps string
+		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
+		}
+		return out, rows.Err()
 	}
-	return out, rows.Err()
-}
-func (r TaskRepo) ByID(ctx context.Context, id int) (models.SafetyTask, error) {
-	var t models.SafetyTask
-	var choices string
-	err := r.DB.QueryRowContext(ctx, `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks WHERE id=?`, id).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice)
-	if err != nil {
+	func (r TaskRepo) ByID(ctx context.Context, id int) (models.SafetyTask, error) {
+		var t models.SafetyTask
+		var choices, steps string
+		err := r.DB.QueryRowContext(ctx, `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE id=?`, id).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps)
+		if err != nil {
+			return t, err
+		}
+		err = json.Unmarshal([]byte(choices), &t.Choices)
+		if steps != "" { _ = json.Unmarshal([]byte(steps), &t.Steps) }
 		return t, err
 	}
-	err = json.Unmarshal([]byte(choices), &t.Choices)
-	return t, err
-}
 
 func (r TaskRepo) NextForChild(ctx context.Context, childID int, category, difficulty, mode string) (models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
+	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
 	args := []any{childID}
 	if category != "" {
 		q += " AND category=?"
@@ -194,7 +195,7 @@ func (r TaskRepo) NextForChild(ctx context.Context, childID int, category, diffi
 }
 
 func (r TaskRepo) RandomTask(ctx context.Context, category, difficulty, mode string) (models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks WHERE 1=1`
+	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE 1=1`
 	args := []any{}
 	if category != "" {
 		q += " AND category=?"
@@ -214,12 +215,16 @@ func (r TaskRepo) RandomTask(ctx context.Context, category, difficulty, mode str
 
 func (r TaskRepo) scanRandomTask(ctx context.Context, q string, args ...any) (models.SafetyTask, error) {
 	var t models.SafetyTask
-	var choices string
-	err := r.DB.QueryRowContext(ctx, q, args...).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice)
+	var choices, steps string
+	err := r.DB.QueryRowContext(ctx, q, args...).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps)
 	if err != nil {
 		return t, err
 	}
-	return t, json.Unmarshal([]byte(choices), &t.Choices)
+	if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
+		return t, err
+	}
+	if steps != "" { _ = json.Unmarshal([]byte(steps), &t.Steps) }
+	return t, nil
 }
 
 // NextForChildBatch returns several untried tasks at once, so the home
@@ -228,7 +233,7 @@ func (r TaskRepo) NextForChildBatch(ctx context.Context, childID int, category, 
 	if limit < 1 {
 		limit = 5
 	}
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
+	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
 	args := []any{childID}
 	if category != "" {
 		q += " AND category=?"
@@ -252,8 +257,8 @@ func (r TaskRepo) NextForChildBatch(ctx context.Context, childID int, category, 
 	out := []models.SafetyTask{}
 	for rows.Next() {
 		var t models.SafetyTask
-		var choices string
-		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice); err != nil {
+		var choices, steps string
+		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
@@ -466,7 +471,7 @@ func (r TaskRepo) Save(ctx context.Context, t models.SafetyTask) (models.SafetyT
 		return t, err
 	}
 	if t.ID == 0 {
-		res, err := r.DB.ExecContext(ctx, `INSERT INTO tasks(category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice) VALUES(?,?,?,?,?,?,?,?,?,?)`, t.Category, t.Scene, t.Title, t.Description, t.Prompt, string(choices), t.Difficulty, t.AnswerMode, t.SafetyTip, t.CorrectChoice)
+		res, err := r.DB.ExecContext(ctx, `INSERT INTO tasks(category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json) VALUES(?,?,?,?,?,?,?,?,?,?)`, t.Category, t.Scene, t.Title, t.Description, t.Prompt, string(choices), t.Difficulty, t.AnswerMode, t.SafetyTip, t.CorrectChoice)
 		if err != nil {
 			return t, err
 		}
