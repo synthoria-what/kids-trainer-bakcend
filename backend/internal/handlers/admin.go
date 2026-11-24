@@ -3,7 +3,6 @@ package handlers
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/kids-trainer/backend/internal/repositories"
 	"github.com/kids-trainer/backend/internal/models"
 )
 
@@ -86,7 +86,7 @@ func (h *Handler) SaveTask(c *gin.Context) {
 		return
 	}
 	t, err := h.Tasks.Save(c, t)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, repositories.ErrNoDocuments) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
 		return
 	}

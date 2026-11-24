@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -108,7 +107,7 @@ func (h *Handler) Me(c *gin.Context) {
 					out["linked_parent_name"] = parent.Name
 				}
 			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
+		} else if !errors.Is(err, repositories.ErrNoDocuments) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load profile"})
 			return
 		}
@@ -180,7 +179,7 @@ func (h *Handler) Join(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "child is linked to another parent"})
 		return
 	}
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, repositories.ErrNoDocuments) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "code is invalid or expired"})
 		return
 	}

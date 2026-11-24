@@ -15,6 +15,8 @@ type Config struct {
 	DevMode                    bool
 	HTTPAddr                   string
 	DatabasePath               string
+	MongoURI                   string
+	MongoDB                    string
 	JWTSecret                  string
 	JWTTL                      time.Duration
 	CORSOrigins                []string
@@ -39,6 +41,8 @@ func Load() (*Config, error) {
 		DevMode:         getEnv("APP_ENV", "production") == "development",
 		HTTPAddr:        getEnv("HTTP_ADDR", ":8080"),
 		DatabasePath:    getEnv("DATABASE_PATH", "./data/safe_route.db"),
+		MongoURI:        getEnv("MONGO_URI", "mongodb://127.0.0.1:27017"),
+		MongoDB:         getEnv("MONGO_DB", "safe_route"),
 		JWTSecret:       getEnv("JWT_SECRET", "dev-secret-change-me"),
 		CORSOrigins:     splitEnv(getEnv("CORS_ORIGINS", "http://localhost:3000")),
 		AIURL:           getEnv("AI_API_URL", "https://lenec.tech/v1/chat/completions"),

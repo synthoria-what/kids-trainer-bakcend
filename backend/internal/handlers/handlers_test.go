@@ -2,10 +2,11 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,27 +17,105 @@ import (
 	"github.com/kids-trainer/backend/internal/database"
 	"github.com/kids-trainer/backend/internal/repositories"
 	"github.com/kids-trainer/backend/internal/services"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type fixture struct {
-	r *gin.Engine
-	h *Handler
-	t *testing.T
+	r    *gin.Engine
+	h    *Handler
+	t    *testing.T
+	// db holds a direct Mongo client so tests can seed rows bypassing HTTP.
+	db     *mongo.Client
+	dbName string
+}
+
+// mongoURI points at the local MongoDB instance. Tests use one throwaway
+// database per test function and drop it on cleanup.
+const mongoURI = "mongodb://127.0.0.1:27017"
+
+func testDBName(t *testing.T) string {
+	t.Helper()
+	return "safe_route_test_" + strings.NewReplacer("/", "_", "-", "_").Replace(t.Name())
 }
 
 func setup(t *testing.T) fixture {
 	t.Helper()
+	if os.Getenv("SKIP_MONGO_TESTS") != "" {
+		t.Skip("MongoDB not available")
+	}
 	gin.SetMode(gin.TestMode)
-	db, err := database.Open(filepath.Join(t.TempDir(), "test.db"))
+	ctx := context.Background()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
+		t.Skipf("mongo unavailable: %v", err)
+	}
+	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(ctx)
+		t.Skipf("mongo unavailable: %v", err)
+	}
+	dbName := testDBName(t)
+	_ = client.Database(dbName).Drop(ctx)
+	if err := database.Migrate(client, dbName); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
-	h := New(Handler{Users: repositories.UserRepo{DB: db}, Tasks: repositories.TaskRepo{DB: db}, Activity: repositories.ActivityRepo{DB: db}, Invites: repositories.InviteRepo{DB: db}, Auth: auth.New("test-secret", time.Hour), AI: services.NewAIService(&config.Config{}), DevMode: true, AdminLogin: "developer", AdminPassword: "test-password-12345"})
+	if err := database.SeedExtraTasks(client, dbName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Database(dbName).Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	h := New(Handler{
+		Users:    repositories.UserRepo{Client: client, DBName: dbName},
+		Tasks:    repositories.TaskRepo{Client: client, DBName: dbName},
+		Activity: repositories.ActivityRepo{Client: client, DBName: dbName},
+		Invites:  repositories.InviteRepo{Client: client, DBName: dbName},
+		Auth:     auth.New("test-secret", time.Hour),
+		AI:       services.NewAIService(&config.Config{}),
+		DevMode:  true, AdminLogin: "developer", AdminPassword: "test-password-12345",
+	})
 	r := gin.New()
 	RegisterRoutes(r, h)
-	return fixture{r, h, t}
+	return fixture{r, h, t, client, dbName}
 }
+
+// insertAttempt seeds a task_attempt row directly, with an optional child
+// login to resolve its id from the users collection.
+func (f fixture) insertAttempt(childID int64, taskID int64, answer, mode string, safe bool) {
+	f.t.Helper()
+	col := f.db.Database(f.dbName).Collection("task_attempts")
+	_, err := col.InsertOne(context.Background(), bson.M{
+		"child_id":    childID,
+		"task_id":     taskID,
+		"answer":      answer,
+		"mode":        mode,
+		"ai_is_safe":  safe,
+		"ai_summary":  "",
+		"ai_tip":      "",
+		"ai_is_demo":  false,
+		"created_at":  time.Now(),
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// loginID returns the numeric user id for a login.
+func (f fixture) loginID(login string) int64 {
+	f.t.Helper()
+	var doc struct {
+		ID int64 `bson:"id"`
+	}
+	err := f.db.Database(f.dbName).Collection("users").FindOne(context.Background(), bson.M{"login": login}).Decode(&doc)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return doc.ID
+}
+
+
 func (f fixture) call(method, path, token string, body any, status int) map[string]any {
 	f.t.Helper()
 	data, _ := json.Marshal(body)
@@ -64,7 +143,6 @@ func (f fixture) account(login, role string) string {
 func (f fixture) admin() string {
 	return f.call("POST", "/auth/admin", "", map[string]any{"login": "developer", "password": "test-password-12345"}, 200)["token"].(string)
 }
-
 func TestPaletteBelongsToAuthenticatedAccount(t *testing.T) {
 	f := setup(t)
 	child := f.account("theme-child", "child")
@@ -210,8 +288,21 @@ func TestPlatinumAndGlobalStatsUseUniqueCompletedMissions(t *testing.T) {
 	id := f.call("GET", "/me", child, nil, 200)["id"]
 	catalog := f.call("GET", "/tasks", child, nil, 200)["tasks"].([]any)
 	task := catalog[0].(map[string]any)
-	if _, err := f.h.Tasks.DB.Exec(`INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe) SELECT ?,id,'fixture','free',1 FROM tasks WHERE id<>?`, id, task["id"]); err != nil {
+	// Seed solved attempts for every task except the current one.
+	allCol := f.db.Database(f.dbName).Collection("tasks")
+	cursor, err := allCol.Find(context.Background(), bson.M{"id": bson.M{"$ne": task["id"]}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	var docs []struct {
+		ID int64 `bson:"id"`
+	}
+	if err := cursor.All(context.Background(), &docs); err != nil {
+		t.Fatal(err)
+	}
+	childID := int64(id.(float64))
+	for _, d := range docs {
+		f.insertAttempt(childID, d.ID, "fixture", "free", true)
 	}
 	if p := f.call("GET", "/child/progress", child, nil, 200); p["platinum"] == true {
 		t.Fatal(p)
@@ -263,10 +354,7 @@ func TestNextTaskBatchSupportsFiltersAndExcludesAttempted(t *testing.T) {
 		seen[id] = true
 	}
 	attempted := batch[0].(map[string]any)["id"].(float64)
-	_, err := f.h.Tasks.DB.Exec(`INSERT INTO task_attempts(child_id,task_id,answer,mode) SELECT id,?,'answer','free' FROM users WHERE login='batch-child'`, int(attempted))
-	if err != nil {
-		t.Fatal(err)
-	}
+	f.insertAttempt(f.loginID("batch-child"), int64(attempted), "answer", "free", false)
 	batch = f.call("GET", path, child, nil, 200)["tasks"].([]any)
 	for _, value := range batch {
 		if value.(map[string]any)["id"] == attempted {

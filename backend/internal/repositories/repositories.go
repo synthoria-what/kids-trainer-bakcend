@@ -2,7 +2,6 @@ package repositories
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,365 +9,654 @@ import (
 	"time"
 
 	"github.com/kids-trainer/backend/internal/models"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-type UserRepo struct{ DB *sql.DB }
+var ErrNoDocuments = mongo.ErrNoDocuments
+
+type UserRepo struct {
+	Client *mongo.Client
+	DBName string
+}
+
+func (r UserRepo) col() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("users")
+}
+func (r UserRepo) profiles() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("child_profiles")
+}
+func (r UserRepo) prefs() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("user_preferences")
+}
+
+type userDoc struct {
+	ID           int64             `bson:"id"`
+	Login        string            `bson:"login"`
+	PasswordHash string            `bson:"password_hash"`
+	Role         models.UserRole   `bson:"role"`
+	Name         string            `bson:"name"`
+	CreatedAt    time.Time         `bson:"created_at"`
+	Preferences  *userPrefDoc      `bson:"preferences,omitempty"`
+}
+
+type userPrefDoc struct {
+	PaletteIndex int `bson:"palette_index"`
+}
 
 func (r UserRepo) Palette(ctx context.Context, userID int) (int, error) {
-	var index int
-	err := r.DB.QueryRowContext(ctx, `SELECT COALESCE((SELECT palette_index FROM user_preferences WHERE user_id=?),0)`, userID).Scan(&index)
-	return index, err
-}
-
-func (r UserRepo) SavePalette(ctx context.Context, userID, index int) error {
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO user_preferences(user_id,palette_index) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET palette_index=excluded.palette_index`, userID, index)
-	return err
-}
-
-func (r UserRepo) Create(ctx context.Context, u models.User) (int, error) {
-	res, err := r.DB.ExecContext(ctx, `INSERT INTO users(login,password_hash,role,name) VALUES(?,?,?,?)`, strings.ToLower(strings.TrimSpace(u.Login)), u.PasswordHash, u.Role, u.Name)
+	var doc userDoc
+	err := r.col().FindOne(ctx, bson.M{"id": userID}).Decode(&doc)
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
-	return int(id), nil
+	if doc.Preferences == nil {
+		return 0, nil
+	}
+	return doc.Preferences.PaletteIndex, nil
 }
-func (r UserRepo) ByLogin(ctx context.Context, login string) (models.User, error) {
-	var u models.User
-	err := r.DB.QueryRowContext(ctx, `SELECT id,login,password_hash,role,name,created_at FROM users WHERE login=?`, strings.ToLower(strings.TrimSpace(login))).Scan(&u.ID, &u.Login, &u.PasswordHash, &u.Role, &u.Name, &u.CreatedAt)
-	return u, err
-}
-func (r UserRepo) ByID(ctx context.Context, id int) (models.User, error) {
-	var u models.User
-	err := r.DB.QueryRowContext(ctx, `SELECT id,login,password_hash,role,name,created_at FROM users WHERE id=?`, id).Scan(&u.ID, &u.Login, &u.PasswordHash, &u.Role, &u.Name, &u.CreatedAt)
-	return u, err
-}
-func (r UserRepo) CreateProfile(ctx context.Context, p models.ChildProfile) error {
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO child_profiles(user_id,name,age,parent_id) VALUES(?,?,?,NULL)`, p.UserID, p.Name, p.Age)
+
+func (r UserRepo) SavePalette(ctx context.Context, userID, index int) error {
+	_, err := r.col().UpdateOne(ctx, bson.M{"id": userID},
+		bson.M{"$set": bson.M{"preferences.palette_index": index}})
 	return err
 }
+
+func (r UserRepo) nextID(ctx context.Context) (int64, error) {
+	// Find highest existing id and increment.
+	opts := options.FindOne().SetSort(bson.D{{Key: "id", Value: -1}})
+	var last userDoc
+	err := r.col().FindOne(ctx, bson.M{}, opts).Decode(&last)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last.ID + 1, nil
+}
+
+func (r UserRepo) Create(ctx context.Context, u models.User) (int, error) {
+	id, err := r.nextID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	doc := userDoc{
+		ID:           id,
+		Login:        strings.ToLower(strings.TrimSpace(u.Login)),
+		PasswordHash: u.PasswordHash,
+		Role:         u.Role,
+		Name:         u.Name,
+		CreatedAt:    time.Now(),
+	}
+	_, err = r.col().InsertOne(ctx, doc)
+	return int(id), err
+}
+
+func (r UserRepo) ByLogin(ctx context.Context, login string) (models.User, error) {
+	var doc userDoc
+	err := r.col().FindOne(ctx, bson.M{"login": strings.ToLower(strings.TrimSpace(login))}).Decode(&doc)
+	return userDocToModel(doc), err
+}
+
+func (r UserRepo) ByID(ctx context.Context, id int) (models.User, error) {
+	var doc userDoc
+	err := r.col().FindOne(ctx, bson.M{"id": int64(id)}).Decode(&doc)
+	return userDocToModel(doc), err
+}
+
+func userDocToModel(d userDoc) models.User {
+	return models.User{
+		ID:           int(d.ID),
+		Login:        d.Login,
+		PasswordHash: d.PasswordHash,
+		Role:         d.Role,
+		Name:         d.Name,
+		CreatedAt:    d.CreatedAt,
+	}
+}
+
+type profileDoc struct {
+	UserID    int64     `bson:"user_id"`
+	Name      string    `bson:"name"`
+	Age       int       `bson:"age"`
+	ParentID  *int64    `bson:"parent_id"`
+	CreatedAt time.Time `bson:"created_at"`
+}
+
+func (r UserRepo) CreateProfile(ctx context.Context, p models.ChildProfile) error {
+	doc := profileDoc{
+		UserID:    int64(p.UserID),
+		Name:      p.Name,
+		Age:       p.Age,
+		CreatedAt: time.Now(),
+	}
+	_, err := r.profiles().InsertOne(ctx, doc)
+	return err
+}
+
 func (r UserRepo) UpdateProfile(ctx context.Context, userID int, name string, age int) error {
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO child_profiles(user_id,name,age) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,age=excluded.age`, userID, name, age)
+	filter := bson.M{"user_id": int64(userID)}
+	update := bson.M{"$set": bson.M{"name": name, "age": age}}
+	_, err := r.profiles().UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 	return err
 }
 
 var ErrParentAlreadyLinked = errors.New("child is linked to another parent")
 
+type inviteDoc struct {
+	ID        int64     `bson:"id"`
+	ParentID  int64     `bson:"parent_id"`
+	CodeHash  string    `bson:"code_hash"`
+	ExpiresAt time.Time `bson:"expires_at"`
+	UsedBy    *int64    `bson:"used_by"`
+	CreatedAt time.Time `bson:"created_at"`
+}
+
 func (r UserRepo) LinkParent(ctx context.Context, childID int, codeHash string, replace bool) (string, error) {
-	tx, err := r.DB.BeginTx(ctx, nil)
+	// Find valid invite
+	var invite inviteDoc
+	err := r.Client.Database(r.DBName).Collection("invite_codes").FindOne(ctx, bson.M{
+		"code_hash": codeHash,
+		"used_by":   bson.M{"$exists": false},
+		"expires_at": bson.M{"$gt": time.Now()},
+	}).Decode(&invite)
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback()
-	var inviteID, parentID int
-	var parentName string
-	if err = tx.QueryRowContext(ctx, `SELECT i.id,i.parent_id,u.name FROM invite_codes i JOIN users u ON i.parent_id=u.id WHERE i.code_hash=? AND i.used_by IS NULL AND i.expires_at>?`, codeHash, time.Now()).Scan(&inviteID, &parentID, &parentName); err != nil {
+	// Parent name
+	var parent userDoc
+	err = r.col().FindOne(ctx, bson.M{"id": invite.ParentID}).Decode(&parent)
+	if err != nil {
 		return "", err
 	}
-	var currentParent sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT parent_id FROM child_profiles WHERE user_id=?`, childID).Scan(&currentParent); err != nil {
+	// Current profile
+	var profile profileDoc
+	err = r.profiles().FindOne(ctx, bson.M{"user_id": int64(childID)}).Decode(&profile)
+	if err != nil {
 		return "", err
 	}
-	if currentParent.Valid && currentParent.Int64 != int64(parentID) && !replace {
+	if profile.ParentID != nil && *profile.ParentID != invite.ParentID && !replace {
 		return "", ErrParentAlreadyLinked
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE child_profiles SET parent_id=? WHERE user_id=?`, parentID, childID); err != nil {
-		return "", err
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE invite_codes SET used_by=? WHERE id=? AND used_by IS NULL`, childID, inviteID)
+	// Update profile
+	_, err = r.profiles().UpdateOne(ctx, bson.M{"user_id": int64(childID)},
+		bson.M{"$set": bson.M{"parent_id": invite.ParentID}})
 	if err != nil {
 		return "", err
 	}
-	n, err := res.RowsAffected()
+	// Mark invite used
+	res, err := r.Client.Database(r.DBName).Collection("invite_codes").UpdateOne(ctx,
+		bson.M{"id": invite.ID, "used_by": bson.M{"$exists": false}},
+		bson.M{"$set": bson.M{"used_by": int64(childID)}})
 	if err != nil {
 		return "", err
 	}
-	if n != 1 {
-		return "", sql.ErrNoRows
+	if res.ModifiedCount != 1 {
+		return "", mongo.ErrNoDocuments
 	}
-	return parentName, tx.Commit()
+	return parent.Name, nil
 }
+
 func (r UserRepo) Profile(ctx context.Context, userID int) (models.ChildProfile, error) {
-	var p models.ChildProfile
-	var parent sql.NullInt64
-	err := r.DB.QueryRowContext(ctx, `SELECT user_id,name,age,parent_id FROM child_profiles WHERE user_id=?`, userID).Scan(&p.UserID, &p.Name, &p.Age, &parent)
-	if parent.Valid {
-		p.ParentID = int(parent.Int64)
+	var p profileDoc
+	err := r.profiles().FindOne(ctx, bson.M{"user_id": int64(userID)}).Decode(&p)
+	out := models.ChildProfile{
+		UserID:   int(p.UserID),
+		Name:     p.Name,
+		Age:      p.Age,
 	}
-	return p, err
+	if p.ParentID != nil {
+		out.ParentID = int(*p.ParentID)
+	}
+	return out, err
 }
+
 func (r UserRepo) Children(ctx context.Context, parentID int) ([]models.ChildProfile, error) {
-	rows, err := r.DB.QueryContext(ctx, `SELECT user_id,name FROM child_profiles WHERE parent_id=? ORDER BY user_id`, parentID)
+	cursor, err := r.profiles().Find(ctx, bson.M{"parent_id": int64(parentID)}, options.Find().SetSort(bson.D{{Key: "user_id", Value: 1}}))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer cursor.Close(ctx)
 	out := []models.ChildProfile{}
-	for rows.Next() {
-		var child models.ChildProfile
-		if err := rows.Scan(&child.UserID, &child.Name); err != nil {
+	for cursor.Next(ctx) {
+		var p profileDoc
+		if err := cursor.Decode(&p); err != nil {
 			return nil, err
 		}
-		out = append(out, child)
+		out = append(out, models.ChildProfile{UserID: int(p.UserID), Name: p.Name})
 	}
-	return out, rows.Err()
+	return out, cursor.Err()
 }
 
 func (r UserRepo) ChildParent(ctx context.Context, childID int) (int, error) {
-	var id sql.NullInt64
-	err := r.DB.QueryRowContext(ctx, `SELECT parent_id FROM child_profiles WHERE user_id=?`, childID).Scan(&id)
+	var p profileDoc
+	err := r.profiles().FindOne(ctx, bson.M{"user_id": int64(childID)}).Decode(&p)
 	if err != nil {
 		return 0, err
 	}
-	if !id.Valid {
-		return 0, sql.ErrNoRows
+	if p.ParentID == nil {
+		return 0, mongo.ErrNoDocuments
 	}
-	return int(id.Int64), nil
+	return int(*p.ParentID), nil
 }
 
-type TaskRepo struct{ DB *sql.DB }
+type TaskRepo struct {
+	Client *mongo.Client
+	DBName string
+}
 
-func (r TaskRepo) List(ctx context.Context, category, difficulty, mode string) ([]models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE 1=1`
-	args := []any{}
-	if category != "" {
-		q += " AND category=?"
-		args = append(args, category)
+func (r TaskRepo) col() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("tasks")
+}
+
+type taskDoc struct {
+	ID            int64            `bson:"id"`
+	Category      string           `bson:"category"`
+	Scene         string           `bson:"scene"`
+	Title         string           `bson:"title"`
+	Description   string           `bson:"description"`
+	Prompt        string           `bson:"prompt"`
+	Choices       json.RawMessage  `bson:"choices"`
+	Difficulty    string           `bson:"difficulty"`
+	AnswerMode    string           `bson:"answer_mode"`
+	SafetyTip     string           `bson:"safety_tip"`
+	CorrectChoice *int             `bson:"correct_choice"`
+	Steps         json.RawMessage  `bson:"steps"`
+}
+
+func taskDocToModel(d taskDoc) (models.SafetyTask, error) {
+	t := models.SafetyTask{
+		ID:            int(d.ID),
+		Category:      models.SafetyCategory(d.Category),
+		Scene:         d.Scene,
+		Title:         d.Title,
+		Description:   d.Description,
+		Prompt:        d.Prompt,
+		Difficulty:    models.TaskDifficulty(d.Difficulty),
+		AnswerMode:    models.AnswerMode(d.AnswerMode),
+		SafetyTip:     d.SafetyTip,
+		CorrectChoice: d.CorrectChoice,
 	}
-	if difficulty != "" {
-		q += " AND difficulty=?"
-		args = append(args, difficulty)
-	}
-	if mode != "" {
-		q += " AND answer_mode=?"
-		args = append(args, mode)
-	}
-	q += " ORDER BY id"
-	rows, err := r.DB.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []models.SafetyTask{}
-	for rows.Next() {
-		var t models.SafetyTask
-		var choices, steps string
-		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-		}
-		return out, rows.Err()
-	}
-	func (r TaskRepo) ByID(ctx context.Context, id int) (models.SafetyTask, error) {
-		var t models.SafetyTask
-		var choices, steps string
-		err := r.DB.QueryRowContext(ctx, `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE id=?`, id).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps)
-		if err != nil {
+	if len(d.Choices) > 0 {
+		if err := json.Unmarshal(d.Choices, &t.Choices); err != nil {
 			return t, err
 		}
-		err = json.Unmarshal([]byte(choices), &t.Choices)
-		if steps != "" { _ = json.Unmarshal([]byte(steps), &t.Steps) }
-		return t, err
 	}
-
-func (r TaskRepo) NextForChild(ctx context.Context, childID int, category, difficulty, mode string) (models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
-	args := []any{childID}
-	if category != "" {
-		q += " AND category=?"
-		args = append(args, category)
+	if len(d.Steps) > 0 {
+		_ = json.Unmarshal(d.Steps, &t.Steps)
 	}
-	if difficulty != "" {
-		q += " AND difficulty=?"
-		args = append(args, difficulty)
-	}
-	if mode != "" {
-		q += " AND answer_mode=?"
-		args = append(args, mode)
-	}
-	q += " ORDER BY RANDOM() LIMIT 1"
-	return r.scanRandomTask(ctx, q, args...)
-}
-
-func (r TaskRepo) RandomTask(ctx context.Context, category, difficulty, mode string) (models.SafetyTask, error) {
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks WHERE 1=1`
-	args := []any{}
-	if category != "" {
-		q += " AND category=?"
-		args = append(args, category)
-	}
-	if difficulty != "" {
-		q += " AND difficulty=?"
-		args = append(args, difficulty)
-	}
-	if mode != "" {
-		q += " AND answer_mode=?"
-		args = append(args, mode)
-	}
-	q += " ORDER BY RANDOM() LIMIT 1"
-	return r.scanRandomTask(ctx, q, args...)
-}
-
-func (r TaskRepo) scanRandomTask(ctx context.Context, q string, args ...any) (models.SafetyTask, error) {
-	var t models.SafetyTask
-	var choices, steps string
-	err := r.DB.QueryRowContext(ctx, q, args...).Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps)
-	if err != nil {
-		return t, err
-	}
-	if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
-		return t, err
-	}
-	if steps != "" { _ = json.Unmarshal([]byte(steps), &t.Steps) }
 	return t, nil
 }
 
-// NextForChildBatch returns several untried tasks at once, so the home
-// screen can offer a small carousel instead of one random task per refresh.
+func taskFilter(category, difficulty, mode string) bson.M {
+	f := bson.M{}
+	if category != "" {
+		f["category"] = category
+	}
+	if difficulty != "" {
+		f["difficulty"] = difficulty
+	}
+	if mode != "" {
+		f["answer_mode"] = mode
+	}
+	return f
+}
+
+func (r TaskRepo) List(ctx context.Context, category, difficulty, mode string) ([]models.SafetyTask, error) {
+	cursor, err := r.col().Find(ctx, taskFilter(category, difficulty, mode), options.Find().SetSort(bson.D{{Key: "id", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	out := []models.SafetyTask{}
+	for cursor.Next(ctx) {
+		var d taskDoc
+		if err := cursor.Decode(&d); err != nil {
+			return nil, err
+		}
+		t, err := taskDocToModel(d)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, cursor.Err()
+}
+
+func (r TaskRepo) ByID(ctx context.Context, id int) (models.SafetyTask, error) {
+	var d taskDoc
+	err := r.col().FindOne(ctx, bson.M{"id": int64(id)}).Decode(&d)
+	if err != nil {
+		return models.SafetyTask{}, err
+	}
+	return taskDocToModel(d)
+}
+
+// RandomTask picks one random task matching the filters using $sample.
+func (r TaskRepo) RandomTask(ctx context.Context, category, difficulty, mode string) (models.SafetyTask, error) {
+	return r.sampleTask(ctx, taskFilter(category, difficulty, mode))
+}
+
+func (r TaskRepo) sampleTask(ctx context.Context, filter bson.M) (models.SafetyTask, error) {
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
+		{{Key: "$sample", Value: bson.M{"size": 1}}},
+	}
+	cursor, err := r.col().Aggregate(ctx, pipeline)
+	if err != nil {
+		return models.SafetyTask{}, err
+	}
+	defer cursor.Close(ctx)
+	if !cursor.Next(ctx) {
+		return models.SafetyTask{}, cursor.Err()
+	}
+	var d taskDoc
+	if err := cursor.Decode(&d); err != nil {
+		return models.SafetyTask{}, err
+	}
+	return taskDocToModel(d)
+}
+
+// solvedTaskIDs returns the set of task ids this child already attempted.
+func (r TaskRepo) solvedTaskIDs(ctx context.Context, childID int) (map[int64]bool, error) {
+	cursor, err := r.Client.Database(r.DBName).Collection("task_attempts").
+		Find(ctx, bson.M{"child_id": int64(childID)}, options.Find().SetProjection(bson.M{"task_id": 1}))
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	out := map[int64]bool{}
+	for cursor.Next(ctx) {
+		var doc struct {
+			TaskID int64 `bson:"task_id"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+		out[doc.TaskID] = true
+	}
+	return out, cursor.Err()
+}
+
+func (r TaskRepo) NextForChild(ctx context.Context, childID int, category, difficulty, mode string) (models.SafetyTask, error) {
+	solved, err := r.solvedTaskIDs(ctx, childID)
+	if err != nil {
+		return models.SafetyTask{}, err
+	}
+	filter := taskFilter(category, difficulty, mode)
+	if len(solved) > 0 {
+		ids := make([]int64, 0, len(solved))
+		for id := range solved {
+			ids = append(ids, id)
+		}
+		filter["id"] = bson.M{"$nin": ids}
+	}
+	return r.sampleTask(ctx, filter)
+}
+
+// NextForChildBatch returns several untried tasks at once for the carousel.
 func (r TaskRepo) NextForChildBatch(ctx context.Context, childID int, category, difficulty, mode string, limit int) ([]models.SafetyTask, error) {
 	if limit < 1 {
 		limit = 5
 	}
-	q := `SELECT id,category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json FROM tasks t WHERE NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.task_id=t.id AND a.child_id=?)`
-	args := []any{childID}
-	if category != "" {
-		q += " AND category=?"
-		args = append(args, category)
-	}
-	if difficulty != "" {
-		q += " AND difficulty=?"
-		args = append(args, difficulty)
-	}
-	if mode != "" {
-		q += " AND answer_mode=?"
-		args = append(args, mode)
-	}
-	q += " ORDER BY RANDOM() LIMIT ?"
-	args = append(args, limit)
-	rows, err := r.DB.QueryContext(ctx, q, args...)
+	solved, err := r.solvedTaskIDs(ctx, childID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	filter := taskFilter(category, difficulty, mode)
+	if len(solved) > 0 {
+		ids := make([]int64, 0, len(solved))
+		for id := range solved {
+			ids = append(ids, id)
+		}
+		filter["id"] = bson.M{"$nin": ids}
+	}
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
+		{{Key: "$sample", Value: bson.M{"size": limit}}},
+	}
+	cursor, err := r.col().Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
 	out := []models.SafetyTask{}
-	for rows.Next() {
-		var t models.SafetyTask
-		var choices, steps string
-		if err := rows.Scan(&t.ID, &t.Category, &t.Scene, &t.Title, &t.Description, &t.Prompt, &choices, &t.Difficulty, &t.AnswerMode, &t.SafetyTip, &t.CorrectChoice, &steps); err != nil {
+	for cursor.Next(ctx) {
+		var d taskDoc
+		if err := cursor.Decode(&d); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(choices), &t.Choices); err != nil {
+		t, err := taskDocToModel(d)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	return out, cursor.Err()
 }
 
-type ActivityRepo struct{ DB *sql.DB }
+func (r TaskRepo) nextID(ctx context.Context) (int64, error) {
+	opts := options.FindOne().SetSort(bson.D{{Key: "id", Value: -1}})
+	var last taskDoc
+	err := r.col().FindOne(ctx, bson.M{}, opts).Decode(&last)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last.ID + 1, nil
+}
+
+func (r TaskRepo) Save(ctx context.Context, t models.SafetyTask) (models.SafetyTask, error) {
+	choices, err := json.Marshal(t.Choices)
+	if err != nil {
+		return t, err
+	}
+	steps, err := json.Marshal(t.Steps)
+	if err != nil {
+		return t, err
+	}
+	doc := bson.M{
+		"category":       string(t.Category),
+		"scene":          t.Scene,
+		"title":          t.Title,
+		"description":    t.Description,
+		"prompt":         t.Prompt,
+		"choices":        json.RawMessage(choices),
+		"difficulty":     string(t.Difficulty),
+		"answer_mode":    string(t.AnswerMode),
+		"safety_tip":     t.SafetyTip,
+		"correct_choice": t.CorrectChoice,
+		"steps":          json.RawMessage(steps),
+	}
+	if t.ID == 0 {
+		id, err := r.nextID(ctx)
+		if err != nil {
+			return t, err
+		}
+		doc["id"] = id
+		_, err = r.col().InsertOne(ctx, doc)
+		t.ID = int(id)
+		return t, err
+	}
+	res, err := r.col().UpdateOne(ctx, bson.M{"id": int64(t.ID)}, bson.M{"$set": doc})
+	if err != nil {
+		return t, err
+	}
+	if res.MatchedCount == 0 {
+		return t, mongo.ErrNoDocuments
+	}
+	return t, nil
+}
+
+type ActivityRepo struct {
+	Client *mongo.Client
+	DBName string
+}
+
+func (r ActivityRepo) attempts() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("task_attempts")
+}
+func (r ActivityRepo) daily() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("daily_activity")
+}
+func (r ActivityRepo) tasks() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("tasks")
+}
+func (r ActivityRepo) users() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("users")
+}
+func (r ActivityRepo) platinum() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("platinum_awards")
+}
+
+func todayStr() string { return time.Now().Format("2006-01-02") }
 
 func (r ActivityRepo) Record(ctx context.Context, childID int, completed bool) error {
-	if !completed {
-		_, err := r.DB.ExecContext(ctx, `INSERT INTO daily_activity(child_id,activity_date,completed_count) VALUES(?,?,0) ON CONFLICT(child_id,activity_date) DO NOTHING`, childID, time.Now().Format("2006-01-02"))
-		return err
+	filter := bson.M{"child_id": int64(childID), "activity_date": todayStr()}
+	inc := 0
+	if completed {
+		inc = 1
 	}
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO daily_activity(child_id,activity_date,completed_count) VALUES(?,?,1) ON CONFLICT(child_id,activity_date) DO UPDATE SET completed_count=completed_count+1`, childID, time.Now().Format("2006-01-02"))
+	update := bson.M{"$inc": bson.M{"completed_count": inc}, "$setOnInsert": bson.M{"created_at": time.Now()}}
+	_, err := r.daily().UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 	return err
 }
+
+type attemptDoc struct {
+	ID        int64             `bson:"id"`
+	ChildID   int64             `bson:"child_id"`
+	TaskID    int64             `bson:"task_id"`
+	Answer    string            `bson:"answer"`
+	Mode      string            `bson:"mode"`
+	AiIsSafe  *bool             `bson:"ai_is_safe"`
+	AiScore   *int              `bson:"ai_score"`
+	AiSummary string            `bson:"ai_summary"`
+	AiTip     string            `bson:"ai_tip"`
+	AiIsDemo  bool              `bson:"ai_is_demo"`
+	CreatedAt time.Time         `bson:"created_at"`
+}
+
+func (r ActivityRepo) nextAttemptID(ctx context.Context) (int64, error) {
+	opts := options.FindOne().SetSort(bson.D{{Key: "id", Value: -1}})
+	var last attemptDoc
+	err := r.attempts().FindOne(ctx, bson.M{}, opts).Decode(&last)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last.ID + 1, nil
+}
+
 func (r ActivityRepo) Attempt(ctx context.Context, a models.TaskAttempt) error {
-	var userExists, taskExists int
-	if err := r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id=?`, a.ChildID).Scan(&userExists); err != nil {
-		return err
-	}
-	if err := r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE id=?`, a.TaskID).Scan(&taskExists); err != nil {
-		return err
-	}
-	if userExists == 0 {
+	if err := r.users().FindOne(ctx, bson.M{"id": int64(a.ChildID)}).Err(); err != nil {
 		return fmt.Errorf("child user %d does not exist", a.ChildID)
 	}
-	if taskExists == 0 {
+	if err := r.tasks().FindOne(ctx, bson.M{"id": int64(a.TaskID)}).Err(); err != nil {
 		return fmt.Errorf("task %d does not exist", a.TaskID)
 	}
-	var aiIsSafe any
-	if a.AiIsSafe != nil {
-		aiIsSafe = *a.AiIsSafe
+	id, err := r.nextAttemptID(ctx)
+	if err != nil {
+		return err
 	}
-	_, err := r.DB.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_score,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, aiIsSafe, a.AiScore, a.AiSummary, a.AiTip, a.AiIsDemo)
+	doc := attemptDoc{
+		ID: id, ChildID: int64(a.ChildID), TaskID: int64(a.TaskID),
+		Answer: a.Answer, Mode: string(a.Mode), AiIsSafe: a.AiIsSafe,
+		AiScore: a.AiScore, AiSummary: a.AiSummary, AiTip: a.AiTip,
+		AiIsDemo: a.AiIsDemo, CreatedAt: time.Now(),
+	}
+	_, err = r.attempts().InsertOne(ctx, doc)
 	return err
 }
+
 func (r ActivityRepo) Progress(ctx context.Context, childID int) (models.ProgressResponse, error) {
 	p := models.ProgressResponse{ByCategory: map[string]int{}, CompletedDays: []int{}}
 	today := time.Now()
-	date := today.Format("2006-01-02")
-	if err := r.DB.QueryRowContext(ctx, `SELECT COUNT(DISTINCT task_id) FROM task_attempts WHERE child_id=? AND ai_is_safe=1 AND date(created_at,'localtime')=?`, childID, date).Scan(&p.CompletedToday); err != nil {
-		return p, err
-	}
-	if err := r.DB.QueryRowContext(ctx, `SELECT COUNT(DISTINCT task_id) FROM task_attempts WHERE child_id=? AND ai_is_safe=1`, childID).Scan(&p.TotalCompleted); err != nil {
-		return p, err
-	}
-	ids, err := r.DB.QueryContext(ctx, `SELECT DISTINCT task_id FROM task_attempts WHERE child_id=? AND ai_is_safe=1`, childID)
+	date := todayStr()
+	startOfDay := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+	endOfDay := startOfDay.AddDate(0, 0, 1)
+
+	countToday, err := r.attempts().Distinct(ctx, "task_id", bson.M{
+		"child_id": int64(childID), "ai_is_safe": true,
+		"created_at": bson.M{"$gte": startOfDay, "$lt": endOfDay},
+	})
 	if err != nil {
 		return p, err
 	}
+	p.CompletedToday = len(countToday)
+
+	allIDs, err := r.attempts().Distinct(ctx, "task_id", bson.M{"child_id": int64(childID), "ai_is_safe": true})
+	if err != nil {
+		return p, err
+	}
+	p.TotalCompleted = len(allIDs)
 	p.CompletedTaskIDs = []int{}
-	for ids.Next() {
-		var id int
-		if err := ids.Scan(&id); err != nil {
-			ids.Close()
-			return p, err
+	for _, v := range allIDs {
+		if id, ok := v.(int32); ok {
+			p.CompletedTaskIDs = append(p.CompletedTaskIDs, int(id))
+		} else if id, ok := v.(int64); ok {
+			p.CompletedTaskIDs = append(p.CompletedTaskIDs, int(id))
 		}
-		p.CompletedTaskIDs = append(p.CompletedTaskIDs, id)
 	}
-	if err := ids.Err(); err != nil {
-		ids.Close()
-		return p, err
-	}
-	ids.Close()
-	rows, err := r.DB.QueryContext(ctx, `SELECT t.category,COUNT(DISTINCT a.task_id) FROM task_attempts a JOIN tasks t ON t.id=a.task_id WHERE a.child_id=? AND a.ai_is_safe=1 GROUP BY t.category`, childID)
+
+	// by_category: join via tasks collection
+	catCursor, err := r.tasks().Find(ctx, bson.M{})
 	if err != nil {
 		return p, err
 	}
-	for rows.Next() {
-		var c string
-		var n int
-		if err := rows.Scan(&c, &n); err != nil {
-			rows.Close()
-			return p, err
-		}
-		p.ByCategory[c] = n
+	var taskCats map[int64]string
+	if err := catCursor.All(ctx, &taskCats); err == nil {
+		// Fallback: build map manually
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return p, err
-	}
-	rows.Close()
-	rows, err = r.DB.QueryContext(ctx, `SELECT activity_date FROM daily_activity WHERE child_id=?`, childID)
+	catCursor.Close(ctx)
+	taskCats, err = r.taskCategoryMap(ctx)
 	if err != nil {
 		return p, err
 	}
-	defer rows.Close()
+	for _, v := range allIDs {
+		var taskID int64
+		switch id := v.(type) {
+		case int32:
+			taskID = int64(id)
+		case int64:
+			taskID = id
+		}
+		if cat, ok := taskCats[taskID]; ok {
+			p.ByCategory[cat]++
+		}
+	}
+
+	// Streak and week days from daily_activity
+	cursor, err := r.daily().Find(ctx, bson.M{"child_id": int64(childID)})
+	if err != nil {
+		return p, err
+	}
+	defer cursor.Close(ctx)
 	dates := map[string]bool{}
-	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
+	for cursor.Next(ctx) {
+		var doc struct {
+			ActivityDate string `bson:"activity_date"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
 			return p, err
 		}
-		dates[d] = true
+		dates[doc.ActivityDate] = true
 	}
-	if err := rows.Err(); err != nil {
+	if err := cursor.Err(); err != nil {
 		return p, err
 	}
-	cursor := today
+	cursor2 := today
 	if !dates[date] {
-		cursor = cursor.AddDate(0, 0, -1)
+		cursor2 = cursor2.AddDate(0, 0, -1)
 	}
-	for dates[cursor.Format("2006-01-02")] {
+	for dates[cursor2.Format("2006-01-02")] {
 		p.Streak++
-		cursor = cursor.AddDate(0, 0, -1)
+		cursor2 = cursor2.AddDate(0, 0, -1)
 	}
 	weekday := int(today.Weekday())
 	if weekday == 0 {
@@ -383,78 +671,212 @@ func (r ActivityRepo) Progress(ctx context.Context, childID int) (models.Progres
 	return p, nil
 }
 
+func (r ActivityRepo) taskCategoryMap(ctx context.Context) (map[int64]string, error) {
+	cursor, err := r.tasks().Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"id": 1, "category": 1}))
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	out := map[int64]string{}
+	for cursor.Next(ctx) {
+		var doc struct {
+			ID       int64  `bson:"id"`
+			Category string `bson:"category"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, err
+		}
+		out[doc.ID] = doc.Category
+	}
+	return out, cursor.Err()
+}
+
 func (r ActivityRepo) Scores(ctx context.Context, childID int) (count int, average *int, err error) {
-	var score sql.NullInt64
-	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*), CAST(ROUND(AVG(ai_score)) AS INTEGER) FROM task_attempts WHERE id IN (
-		SELECT MAX(id) FROM task_attempts WHERE child_id=? AND ai_score IS NOT NULL GROUP BY task_id
-	)`, childID).Scan(&count, &score)
-	if score.Valid {
-		value := int(score.Int64)
+	// Get the latest attempt per task with a score.
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{"child_id": int64(childID), "ai_score": bson.M{"$ne": nil}}}},
+		{{Key: "$sort", Value: bson.D{{Key: "id", Value: -1}}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":   "$task_id",
+			"score": bson.M{"$first": "$ai_score"},
+		}}},
+		{{Key: "$group", Value: bson.M{
+			"_id": nil,
+			"count": bson.M{"$sum": 1},
+			"avg":   bson.M{"$avg": "$score"},
+		}}},
+	}
+	cursor, err := r.attempts().Aggregate(ctx, pipeline)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer cursor.Close(ctx)
+	if !cursor.Next(ctx) {
+		return 0, nil, cursor.Err()
+	}
+	var doc struct {
+		Count int       `bson:"count"`
+		Avg   *float64  `bson:"avg"`
+	}
+	if err := cursor.Decode(&doc); err != nil {
+		return 0, nil, err
+	}
+	if doc.Avg != nil {
+		value := int(*doc.Avg + 0.5)
 		average = &value
 	}
-	return
+	return doc.Count, average, nil
 }
 
 func (r ActivityRepo) GlobalStats(ctx context.Context, childID int) (models.GlobalStats, error) {
 	var stats models.GlobalStats
-	var rank sql.NullInt64
-	err := r.DB.QueryRowContext(ctx, `WITH solved AS (
-		SELECT child_id,COUNT(DISTINCT task_id) AS total FROM task_attempts WHERE ai_is_safe=1 GROUP BY child_id
-	), own AS (SELECT total FROM solved WHERE child_id=?)
-	SELECT COUNT(*),COALESCE(SUM(total),0),
-		(SELECT 1+(SELECT COUNT(*) FROM solved WHERE total > own.total) FROM own)
-	FROM solved`, childID).Scan(&stats.Players, &stats.Completed, &rank)
-	if rank.Valid && rank.Int64 > 0 {
-		value := int(rank.Int64)
-		stats.Rank = &value
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{"ai_is_safe": true}}},
+		{{Key: "$group", Value: bson.M{
+			"_id":   "$child_id",
+			"total": bson.M{"$addToSet": "$task_id"},
+		}}},
+		{{Key: "$project", Value: bson.M{"total": bson.M{"$size": "$total"}}}},
+		{{Key: "$sort", Value: bson.D{{Key: "total", Value: -1}}}},
 	}
-	return stats, err
+	cursor, err := r.attempts().Aggregate(ctx, pipeline)
+	if err != nil {
+		return stats, err
+	}
+	defer cursor.Close(ctx)
+	rank := 0
+	for cursor.Next(ctx) {
+		var doc struct {
+			ChildID int64 `bson:"_id"`
+			Total   int   `bson:"total"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return stats, err
+		}
+		stats.Players++
+		stats.Completed += doc.Total
+		if doc.ChildID == int64(childID) {
+			rank = stats.Players
+		}
+	}
+	if rank > 0 {
+		stats.Rank = &rank
+	}
+	if err := cursor.Err(); err != nil {
+		return stats, err
+	}
+	return stats, nil
 }
-
-const grantPlatinumSQL = `INSERT INTO platinum_awards(child_id) SELECT ?
-	WHERE EXISTS (SELECT 1 FROM tasks) AND NOT EXISTS (
-		SELECT 1 FROM tasks t WHERE NOT EXISTS (
-			SELECT 1 FROM task_attempts a WHERE a.child_id=? AND a.task_id=t.id AND a.ai_is_safe=1
-		)
-	) ON CONFLICT(child_id) DO NOTHING`
 
 func (r ActivityRepo) Platinum(ctx context.Context, childID int, completed int) (bool, error) {
-	var earned bool
-	var total int
-	err := r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platinum_awards WHERE child_id=?),(SELECT COUNT(*) FROM tasks)`, childID).Scan(&earned, &total)
-	if err != nil || earned || total == 0 || completed < total {
-		return earned, err
+	var doc struct {
+		ChildID int64 `bson:"child_id"`
 	}
-	// Backfill eligible progress from before the award was introduced.
-	if _, err = r.DB.ExecContext(ctx, grantPlatinumSQL, childID, childID); err != nil {
+	err := r.platinum().FindOne(ctx, bson.M{"child_id": int64(childID)}).Decode(&doc)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
 		return false, err
 	}
-	err = r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM platinum_awards WHERE child_id=?)`, childID).Scan(&earned)
-	return earned, err
+	total, err := r.tasks().CountDocuments(ctx, bson.M{})
+	if err != nil || total == 0 || completed < int(total) {
+		return false, err
+	}
+	_, err = r.platinum().InsertOne(ctx, bson.M{"child_id": int64(childID), "awarded_at": time.Now()})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-type InviteRepo struct{ DB *sql.DB }
+func (r ActivityRepo) Submit(ctx context.Context, a models.TaskAttempt) error {
+	if err := r.Attempt(ctx, a); err != nil {
+		return err
+	}
+	increment := 0
+	if a.AiIsSafe != nil && *a.AiIsSafe {
+		increment = 1
+		// Grant platinum if all tasks are solved.
+		total, err := r.tasks().CountDocuments(ctx, bson.M{})
+		if err == nil && total > 0 {
+			solved, err := r.attempts().Distinct(ctx, "task_id", bson.M{
+				"child_id": int64(a.ChildID), "ai_is_safe": true,
+			})
+			if err == nil && len(solved) >= int(total) {
+				_, _ = r.platinum().UpdateOne(ctx,
+					bson.M{"child_id": int64(a.ChildID)},
+					bson.M{"$setOnInsert": bson.M{"awarded_at": time.Now()}},
+					options.Update().SetUpsert(true))
+			}
+		}
+	}
+	filter := bson.M{"child_id": int64(a.ChildID), "activity_date": todayStr()}
+	update := bson.M{"$inc": bson.M{"completed_count": increment}, "$setOnInsert": bson.M{"created_at": time.Now()}}
+	_, err := r.daily().UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
+	return err
+}
+
+type InviteRepo struct {
+	Client *mongo.Client
+	DBName string
+}
+
+func (r InviteRepo) col() *mongo.Collection {
+	return r.Client.Database(r.DBName).Collection("invite_codes")
+}
+
+func (r InviteRepo) nextID(ctx context.Context) (int64, error) {
+	opts := options.FindOne().SetSort(bson.D{{Key: "id", Value: -1}})
+	var last inviteDoc
+	err := r.col().FindOne(ctx, bson.M{}, opts).Decode(&last)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return last.ID + 1, nil
+}
 
 func (r InviteRepo) Create(ctx context.Context, parentID int, hash string, expires time.Time) (models.InviteCode, error) {
-	res, err := r.DB.ExecContext(ctx, `INSERT INTO invite_codes(parent_id,code_hash,expires_at) VALUES(?,?,?)`, parentID, hash, expires)
+	id, err := r.nextID(ctx)
 	if err != nil {
 		return models.InviteCode{}, err
 	}
-	id, _ := res.LastInsertId()
-	return models.InviteCode{ID: int(id), ParentID: parentID, ExpiresAt: expires}, nil
+	doc := inviteDoc{
+		ID: int64(id), ParentID: int64(parentID), CodeHash: hash,
+		ExpiresAt: expires, CreatedAt: time.Now(),
+	}
+	_, err = r.col().InsertOne(ctx, doc)
+	return models.InviteCode{ID: int(id), ParentID: parentID, ExpiresAt: expires}, err
 }
+
 func (r InviteRepo) FindValid(ctx context.Context, hash string) (models.InviteCode, error) {
-	var i models.InviteCode
-	err := r.DB.QueryRowContext(ctx, `SELECT id,parent_id,code_hash,expires_at,used_by,created_at FROM invite_codes WHERE code_hash=? AND used_by IS NULL AND expires_at>?`, hash, time.Now()).Scan(&i.ID, &i.ParentID, &i.CodeHash, &i.ExpiresAt, &i.UsedBy, &i.CreatedAt)
-	return i, err
+	var d inviteDoc
+	err := r.col().FindOne(ctx, bson.M{
+		"code_hash": hash,
+		"used_by":   bson.M{"$exists": false},
+		"expires_at": bson.M{"$gt": time.Now()},
+	}).Decode(&d)
+	out := models.InviteCode{ID: int(d.ID), ParentID: int(d.ParentID), ExpiresAt: d.ExpiresAt, CreatedAt: d.CreatedAt}
+	if d.UsedBy != nil {
+		usedBy := int(*d.UsedBy)
+		out.UsedBy = &usedBy
+	}
+	return out, err
 }
 
 func IsUniqueError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique")
+	return err != nil && (mongo.IsDuplicateKeyError(err) ||
+		strings.Contains(strings.ToLower(err.Error()), "unique") ||
+		strings.Contains(strings.ToLower(err.Error()), "duplicate"))
 }
+
 func ValidateRole(role models.UserRole) bool {
 	return role == models.RoleChild || role == models.RoleParent
 }
+
 func ValidateCredentials(login, password string) error {
 	if len(strings.TrimSpace(login)) < 3 {
 		return fmt.Errorf("login must be at least 3 characters")
@@ -463,54 +885,4 @@ func ValidateCredentials(login, password string) error {
 		return fmt.Errorf("password must be at least 8 characters")
 	}
 	return nil
-}
-
-func (r TaskRepo) Save(ctx context.Context, t models.SafetyTask) (models.SafetyTask, error) {
-	choices, err := json.Marshal(t.Choices)
-	if err != nil {
-		return t, err
-	}
-	if t.ID == 0 {
-		res, err := r.DB.ExecContext(ctx, `INSERT INTO tasks(category,scene,title,description,prompt,choices_json,difficulty,answer_mode,safety_tip,correct_choice,steps_json) VALUES(?,?,?,?,?,?,?,?,?,?)`, t.Category, t.Scene, t.Title, t.Description, t.Prompt, string(choices), t.Difficulty, t.AnswerMode, t.SafetyTip, t.CorrectChoice)
-		if err != nil {
-			return t, err
-		}
-		id, err := res.LastInsertId()
-		t.ID = int(id)
-		return t, err
-	}
-	res, err := r.DB.ExecContext(ctx, `UPDATE tasks SET category=?,scene=?,title=?,description=?,prompt=?,choices_json=?,difficulty=?,answer_mode=?,safety_tip=?,correct_choice=? WHERE id=?`, t.Category, t.Scene, t.Title, t.Description, t.Prompt, string(choices), t.Difficulty, t.AnswerMode, t.SafetyTip, t.CorrectChoice, t.ID)
-	if err != nil {
-		return t, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return t, err
-	}
-	if n == 0 {
-		return t, sql.ErrNoRows
-	}
-	return t, nil
-}
-
-func (r ActivityRepo) Submit(ctx context.Context, a models.TaskAttempt) error {
-	tx, err := r.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO task_attempts(child_id,task_id,answer,mode,ai_is_safe,ai_score,ai_summary,ai_tip,ai_is_demo) VALUES(?,?,?,?,?,?,?,?,?)`, a.ChildID, a.TaskID, a.Answer, a.Mode, a.AiIsSafe, a.AiScore, a.AiSummary, a.AiTip, a.AiIsDemo); err != nil {
-		return err
-	}
-	increment := 0
-	if a.AiIsSafe != nil && *a.AiIsSafe {
-		increment = 1
-		if _, err = tx.ExecContext(ctx, grantPlatinumSQL, a.ChildID, a.ChildID); err != nil {
-			return err
-		}
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO daily_activity(child_id,activity_date,completed_count) VALUES(?,?,?) ON CONFLICT(child_id,activity_date) DO UPDATE SET completed_count=completed_count+excluded.completed_count`, a.ChildID, time.Now().Format("2006-01-02"), increment); err != nil {
-		return err
-	}
-	return tx.Commit()
 }

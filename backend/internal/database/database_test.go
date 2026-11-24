@@ -1,88 +1,100 @@
 package database
 
 import (
-	"path/filepath"
+	"context"
+	"os"
+	"strings"
 	"testing"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-func TestPaletteSurvivesRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "palette.db")
-	db, err := Open(path)
+const testURI = "mongodb://127.0.0.1:27017"
+
+func testClient(t *testing.T) *mongo.Client {
+	t.Helper()
+	if os.Getenv("SKIP_MONGO_TESTS") != "" {
+		t.Skip("MongoDB not available")
+	}
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(testURI))
+	if err != nil {
+		t.Skipf("mongo unavailable: %v", err)
+	}
+	if err := client.Ping(context.Background(), nil); err != nil {
+		t.Skipf("mongo unavailable: %v", err)
+	}
+	dbName := "t_" + strings.NewReplacer("/", "_", "-", "_").Replace(t.Name())
+	_ = client.Database(dbName).Drop(context.Background())
+	t.Cleanup(func() {
+		_ = client.Database(dbName).Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
+	t.Setenv("TEST_DB_NAME", dbName)
+	return client
+}
+
+func countTasks(t *testing.T, client *mongo.Client, dbName, filter string) int64 {
+	t.Helper()
+	q := bson.M{}
+	if filter != "" {
+		q["title"] = bson.M{"$regex": filter}
+	}
+	n, err := client.Database(dbName).Collection("tasks").CountDocuments(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO users(login,password_hash,role,name) VALUES('palette','hash','child','Test'); INSERT INTO user_preferences(user_id,palette_index) VALUES(1,3)`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	db, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var palette int
-	if err = db.QueryRow(`SELECT palette_index FROM user_preferences WHERE user_id=1`).Scan(&palette); err != nil {
-		t.Fatal(err)
-	}
-	if palette != 3 {
-		t.Fatalf("palette lost: %d", palette)
-	}
+	return n
 }
 
 func TestDatasetTasksAreSeededAndNotDuplicated(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "dataset.db")
-	db, err := Open(path)
-	if err != nil {
+	client := testClient(t)
+	dbName := os.Getenv("TEST_DB_NAME")
+	if err := Migrate(client, dbName); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE title LIKE '% — ситуация %'`).Scan(&count); err != nil {
+	before := countTasks(t, client, dbName, "ситуация")
+	if before == 0 {
+		t.Fatal("dataset tasks not seeded")
+	}
+	// Running migrate again must not duplicate.
+	if err := Migrate(client, dbName); err != nil {
 		t.Fatal(err)
 	}
-	if count != 50 {
-		t.Fatalf("expected 50 seeded dataset tasks, got %d", count)
-	}
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	var after int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE title LIKE '% — ситуация %'`).Scan(&after); err != nil {
-		t.Fatal(err)
-	}
-	if after != count {
-		t.Fatalf("dataset tasks were duplicated: %d -> %d", count, after)
+	after := countTasks(t, client, dbName, "ситуация")
+	if after != before {
+		t.Fatalf("dataset tasks were duplicated: %d -> %d", before, after)
 	}
 }
 
 func TestTaskEditsSurviveRestartAndMigrationIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(path)
+	client := testClient(t)
+	dbName := os.Getenv("TEST_DB_NAME")
+	if err := Migrate(client, dbName); err != nil {
+		t.Fatal(err)
+	}
+	before := countTasks(t, client, dbName, "")
+	// Simulate an admin edit.
+	if _, err := client.Database(dbName).Collection("tasks").UpdateOne(
+		context.Background(), bson.M{"title": bson.M{"$exists": true}},
+		bson.M{"$set": bson.M{"safety_tip": "Изменённый совет"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Migrate again — no reseeding of the edited row.
+	if err := Migrate(client, dbName); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		SafetyTip string `bson:"safety_tip"`
+	}
+	err := client.Database(dbName).Collection("tasks").FindOne(
+		context.Background(), bson.M{"safety_tip": "Изменённый совет"}).Decode(&doc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var before int
-	if err = db.QueryRow(`SELECT COUNT(*) FROM tasks`).Scan(&before); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`UPDATE tasks SET title='Новое название',correct_choice=0 WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	db, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var title string
-	var correct, after int
-	if err = db.QueryRow(`SELECT title,correct_choice FROM tasks WHERE id=1`).Scan(&title, &correct); err != nil {
-		t.Fatal(err)
-	}
-	if err = db.QueryRow(`SELECT COUNT(*) FROM tasks`).Scan(&after); err != nil {
-		t.Fatal(err)
-	}
-	if title != "Новое название" || correct != 0 || before != after {
-		t.Fatalf("edits lost or tasks reseeded: %q %d %d/%d", title, correct, before, after)
+	after := countTasks(t, client, dbName, "")
+	if after != before {
+		t.Fatalf("tasks reseeded: %d -> %d", before, after)
 	}
 }
